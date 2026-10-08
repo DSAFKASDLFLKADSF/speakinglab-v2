@@ -39,6 +39,7 @@ from audio_features import (
     analyze_audio_features,
     features_from_transcription,
 )
+from scoring_engine import score_interview
 from audio_utils import download_audio, is_publicly_fetchable_url
 from glm_client import DEFAULT_BASE_URL, DEFAULT_MODEL, GlmApiError, call_glm
 from toefl_rubric import ToeflScorePrompt, get_toefl_score_prompt
@@ -316,6 +317,24 @@ class AcousticMetrics(BaseModel):
     source: str = "transcript"
 
 
+class ObjectiveScoreMetrics(BaseModel):
+    pace: float = Field(ge=1, le=5)
+    pronunciation: float = Field(ge=1, le=5)
+    fluency: float = Field(ge=1, le=5)
+
+
+class LanguageScoreMetrics(BaseModel):
+    content: float = Field(ge=1, le=5)
+    grammar_vocabulary: float = Field(ge=1, le=5)
+
+
+class ScoringBreakdown(BaseModel):
+    scoring_version: str = Field(min_length=1)
+    objective: ObjectiveScoreMetrics
+    language: LanguageScoreMetrics
+    overall: float = Field(ge=1, le=5)
+
+
 class ListenRepeatResponse(BaseModel):
     transcript: str
     score: int = Field(ge=1, le=5)
@@ -367,6 +386,7 @@ class InterviewResponse(BaseModel):
     pronunciation_feedback: DeliveryFeedbackBlock | None = None
     acoustic_metrics: AcousticMetrics | None = None
     pronunciation_metrics: PronunciationMetrics | None = None
+    scoring: ScoringBreakdown | None = None
     scores: InterviewScores
     score_summary: str
     metrics: BehaviorMetrics
@@ -647,6 +667,21 @@ def behavior_features_from_transcription(
 
 def acoustic_to_response(features: AudioFeatures) -> AcousticMetrics:
     return AcousticMetrics(**acoustic_metrics_to_dict(features))
+
+
+def scoring_to_response(
+    features: AudioFeatures,
+    pronunciation: NormalizedPronunciationMetrics | None,
+    legacy_scores: dict[str, Any],
+) -> ScoringBreakdown:
+    """Build the Phase 4 breakdown while retaining legacy score fields."""
+    return ScoringBreakdown(
+        **score_interview(
+            acoustic_metrics=acoustic_metrics_to_dict(features),
+            pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
+            legacy_scores=legacy_scores,
+        )
+    )
 
 
 async def analyze_behavior_features(
@@ -1009,6 +1044,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         pronunciation_raw,
     ) = await score_with_glm(score_prompt)
     feedback_raw, score_summary = finalize_score_output(feedback_raw, score_summary)
+    scoring = scoring_to_response(features, pronunciation, scores_raw)
 
     segments = _segments_from_glm(transcript_segments_raw)
     if not segments and transcript.strip():
@@ -1024,6 +1060,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
         acoustic_metrics=acoustic_to_response(features),
         pronunciation_metrics=pronunciation_to_response(pronunciation),
+        scoring=scoring,
         scores=InterviewScores(
             topic=scores_raw.get("topic", 1),
             pace=scores_raw.get("pace", 1),
@@ -1305,6 +1342,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
         timer.mark("glm_scoring", "AI scoring + feedback (GLM)")
 
         feedback_raw, score_summary = finalize_score_output(feedback_raw, score_summary)
+        scoring = scoring_to_response(features, pronunciation, scores_raw)
         segments = _segments_from_glm(transcript_segments_raw)
         if not segments and transcript.strip():
             segments = [
@@ -1319,6 +1357,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
             acoustic_metrics=acoustic_to_response(features),
             pronunciation_metrics=pronunciation_to_response(pronunciation),
+            scoring=scoring,
             scores=InterviewScores(
                 topic=scores_raw.get("topic", 1),
                 pace=scores_raw.get("pace", 1),

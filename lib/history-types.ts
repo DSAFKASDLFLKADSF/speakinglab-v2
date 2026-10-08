@@ -5,6 +5,7 @@ import type {
 } from "@/lib/session-types";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
 import type { InterviewFeedback } from "@/lib/interviewDetailedFeedback";
+import type { ScoringBreakdown } from "@/lib/scoringBreakdown";
 
 export interface PracticeHistoryAudio {
   id: string;
@@ -26,6 +27,7 @@ export interface PracticeHistoryScore {
   rawTotalScore: number | null;
   overallFeedback: string | null;
   aiModel: string;
+  scoring?: ScoringBreakdown;
   createdAt: string;
 }
 

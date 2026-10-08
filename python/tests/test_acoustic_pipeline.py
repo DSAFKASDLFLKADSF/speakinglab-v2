@@ -125,6 +125,11 @@ class AcousticPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_interview_and_listen_repeat_use_decoded_waveform(self):
         interview = await main.run_interview_analysis(self.interview)
         listen_repeat = await main.run_listen_repeat_analysis(self.listen_repeat)
+        interview_scoring = interview.model_dump()["scoring"]
+        self.assertEqual(interview_scoring["scoring_version"], "delivery-v1")
+        self.assertEqual(interview_scoring["language"], {"content": 4.0, "grammar_vocabulary": 4.0})
+        self.assertGreaterEqual(interview_scoring["objective"]["fluency"], 1)
+        self.assertGreaterEqual(interview_scoring["overall"], 1)
         for result in [interview.model_dump(), listen_repeat.model_dump()]:
             self._assert_acoustic(result)
         self._assert_scoring_acoustic(2)

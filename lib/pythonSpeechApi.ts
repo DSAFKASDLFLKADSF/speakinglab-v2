@@ -5,6 +5,7 @@ import type { InterviewScores } from "@/components/InterviewScoreCard";
 import { rewriteAudioUrlForPythonFetch } from "@/lib/audioStorage";
 import type { PythonPronunciationMetrics } from "@/lib/pronunciationMetrics";
 import type { PythonAcousticMetrics } from "@/lib/acousticMetrics";
+import type { PythonScoringBreakdown } from "@/lib/scoringBreakdown";
 
 /** Payload sent to the Python speech analysis service. */
 export interface PythonAnalyzeSpeechRequest {
@@ -90,6 +91,7 @@ export interface PythonAnalyzeInterviewResponse {
   feedback: InterviewFeedback;
   acoustic_metrics?: PythonAcousticMetrics | null;
   pronunciation_metrics?: PythonPronunciationMetrics | null;
+  scoring?: PythonScoringBreakdown | null;
   model?: string;
 }
 

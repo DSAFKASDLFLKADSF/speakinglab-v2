@@ -1,6 +1,7 @@
 import type { InterviewFeedback } from "@/lib/interviewDetailedFeedback";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
 import type { ListenRepeatScore } from "@/components/ScoreCard";
+import type { ScoringBreakdown } from "@/lib/scoringBreakdown";
 
 /** One scored practice item stored under data/practices/{userId}/{id}.json */
 export interface StoredPracticeRecord {
@@ -30,4 +31,5 @@ export interface StoredPracticeRecord {
   scaledScore?: number;
   aiModel?: string;
   metrics?: unknown;
+  scoring?: ScoringBreakdown;
 }

@@ -8,6 +8,7 @@ import {
 } from "@/lib/fileStore";
 import type { StoredPracticeRecord } from "@/lib/practiceStore";
 import type { PythonBehaviorMetrics } from "@/lib/pythonSpeechApi";
+import type { ScoringBreakdown } from "@/lib/scoringBreakdown";
 
 export interface SaveInterviewInput {
   analysisId?: string;
@@ -24,6 +25,7 @@ export interface SaveInterviewInput {
   durationSeconds: number;
   responseSeconds: number;
   aiModel?: string;
+  scoring?: ScoringBreakdown;
 }
 
 export interface SavedInterviewRecord {
@@ -79,6 +81,7 @@ export async function saveInterviewAnalysis(
     scaledScore: ets.scaledScore,
     aiModel: input.aiModel ?? "python-api",
     metrics: input.metrics,
+    ...(input.scoring ? { scoring: input.scoring } : {}),
     status: "completed",
     taskNumber: "1",
   };

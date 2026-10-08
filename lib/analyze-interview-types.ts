@@ -3,6 +3,7 @@ import type { InterviewFeedback } from "@/lib/interviewDetailedFeedback";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
 import type { PronunciationMetrics } from "@/lib/pronunciationMetrics";
 import type { AcousticMetrics } from "@/lib/acousticMetrics";
+import type { ScoringBreakdown } from "@/lib/scoringBreakdown";
 
 export type { BehaviorMetrics };
 
@@ -59,6 +60,7 @@ export interface AnalyzeInterviewResponse {
   feedback: InterviewFeedback;
   acousticMetrics?: AcousticMetrics;
   pronunciationMetrics?: PronunciationMetrics;
+  scoring?: ScoringBreakdown;
   storagePath?: string;
   persisted?: boolean;
   sessionId?: string;

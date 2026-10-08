@@ -11,6 +11,7 @@ import { isDatabaseConfigured } from "@/lib/db";
 import { normalizeInterviewFeedback } from "@/lib/interviewDetailedFeedback";
 import { mapPronunciationMetrics } from "@/lib/pronunciationMetrics";
 import { mapAcousticMetrics } from "@/lib/acousticMetrics";
+import { mapScoringBreakdown } from "@/lib/scoringBreakdown";
 
 function mapIssue(
   raw:
@@ -93,6 +94,7 @@ export async function finalizeInterviewAnalysis(
   } = body;
 
   const feedback = normalizeInterviewFeedback(pythonResult.feedback);
+  const scoring = mapScoringBreakdown(pythonResult.scoring);
 
   let persisted = false;
   let sessionId: string | undefined;
@@ -118,6 +120,7 @@ export async function finalizeInterviewAnalysis(
             : pythonResult.duration_seconds ?? 0,
         responseSeconds: responseSeconds ?? 45,
         aiModel: pythonResult.model ?? "python-api",
+        scoring,
       });
       persisted = true;
       sessionId = saved.sessionId;
@@ -143,6 +146,7 @@ export async function finalizeInterviewAnalysis(
     feedback,
     acousticMetrics: mapAcousticMetrics(pythonResult.acoustic_metrics),
     pronunciationMetrics: mapPronunciationMetrics(pythonResult.pronunciation_metrics),
+    scoring,
     storagePath,
     persisted,
     sessionId,

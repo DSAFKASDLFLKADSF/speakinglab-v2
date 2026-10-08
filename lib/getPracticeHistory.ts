@@ -82,6 +82,7 @@ function toScore(record: StoredPracticeRecord): PracticeHistoryScore | null {
     rawTotalScore: record.listenRepeatScore ?? null,
     overallFeedback: record.feedback?.summary ?? record.scoreSummary ?? null,
     aiModel: record.aiModel ?? "python-api",
+    scoring: record.scoring,
     createdAt: record.createdAt,
   };
 }
