@@ -10,6 +10,7 @@ import { saveInterviewAnalysis } from "@/lib/saveInterviewAnalysis";
 import { isDatabaseConfigured } from "@/lib/db";
 import { normalizeInterviewFeedback } from "@/lib/interviewDetailedFeedback";
 import { mapPronunciationMetrics } from "@/lib/pronunciationMetrics";
+import { mapAcousticMetrics } from "@/lib/acousticMetrics";
 
 function mapIssue(
   raw:
@@ -140,6 +141,7 @@ export async function finalizeInterviewAnalysis(
       longestPauseSeconds: pythonResult.metrics.longest_pause_seconds,
     },
     feedback,
+    acousticMetrics: mapAcousticMetrics(pythonResult.acoustic_metrics),
     pronunciationMetrics: mapPronunciationMetrics(pythonResult.pronunciation_metrics),
     storagePath,
     persisted,

@@ -4,6 +4,7 @@ import type { FeedbackSection } from "@/components/FeedbackCard";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
 import { rewriteAudioUrlForPythonFetch } from "@/lib/audioStorage";
 import type { PythonPronunciationMetrics } from "@/lib/pronunciationMetrics";
+import type { PythonAcousticMetrics } from "@/lib/acousticMetrics";
 
 /** Payload sent to the Python speech analysis service. */
 export interface PythonAnalyzeSpeechRequest {
@@ -40,6 +41,7 @@ export interface PythonAnalyzeSpeechResponse {
   delivery_score?: number;
   language_use_score?: number;
   topic_development_score?: number;
+  acoustic_metrics?: PythonAcousticMetrics | null;
   pronunciation_metrics?: PythonPronunciationMetrics | null;
   model?: string;
 }
@@ -86,6 +88,7 @@ export interface PythonAnalyzeInterviewResponse {
   score_summary: string;
   metrics: PythonBehaviorMetrics;
   feedback: InterviewFeedback;
+  acoustic_metrics?: PythonAcousticMetrics | null;
   pronunciation_metrics?: PythonPronunciationMetrics | null;
   model?: string;
 }

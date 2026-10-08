@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "dev:all": "node scripts/dev-with-speech.mjs",
-    "test": "node --test scripts/test-interview-feedback.cjs scripts/test-regressions.cjs",
+    "test": "node --test scripts/test-interview-feedback.cjs scripts/test-regressions.cjs scripts/test-acoustic-metrics.cjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -91,4 +91,5 @@ curl https://your-python-service.onrender.com/health
 - **`python/.env` is gitignored** — never commit API keys.
 - **Region**: choose `Singapore` if your Zhipu / users are in China-adjacent regions.
 - **Librosa**: if build fails on audio libs, upgrade to a Docker-based deploy.
+- **Waveform metrics**: install `ffmpeg` on the Python service host so browser WebM recordings can be decoded; without it the API marks acoustic metrics as transcript-based estimates.
 - **Cold start**: free/starter plans sleep; first request may take 30–60s.

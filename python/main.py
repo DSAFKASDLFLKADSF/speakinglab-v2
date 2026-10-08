@@ -33,7 +33,12 @@ from analysis import (
     build_word_comparison,
     compute_listen_repeat_score,
 )
-from audio_features import AudioFeatures, features_from_transcription
+from audio_features import (
+    AudioFeatures,
+    acoustic_metrics_to_dict,
+    analyze_audio_features,
+    features_from_transcription,
+)
 from audio_utils import download_audio, is_publicly_fetchable_url
 from glm_client import DEFAULT_BASE_URL, DEFAULT_MODEL, GlmApiError, call_glm
 from toefl_rubric import ToeflScorePrompt, get_toefl_score_prompt
@@ -253,22 +258,6 @@ class ListenRepeatRequest(BaseModel):
     storage_path: str | None = None
 
 
-class ListenRepeatResponse(BaseModel):
-    transcript: str
-    score: int = Field(ge=1, le=5)
-    score_summary: str
-    words: list[ComparisonWord]
-    feedback: FeedbackBlock
-    duration_seconds: float | None = None
-    mime_type: str | None = None
-    file_size_bytes: int | None = None
-    delivery_score: float | None = Field(default=None, ge=0, le=4)
-    language_use_score: float | None = Field(default=None, ge=0, le=4)
-    topic_development_score: float | None = Field(default=None, ge=0, le=4)
-    pronunciation_metrics: PronunciationMetrics | None = None
-    model: str = "python-api"
-
-
 class InterviewRequest(BaseModel):
     audio_url: HttpUrl
     prompt: str = Field(min_length=1)
@@ -290,6 +279,58 @@ class BehaviorMetrics(BaseModel):
     pause_count: int = Field(ge=0)
     filler_word_count: int = Field(ge=0)
     longest_pause_seconds: float = Field(ge=0)
+
+
+class AcousticSpeechMetrics(BaseModel):
+    word_count: int = Field(ge=0)
+    wpm: float = Field(ge=0)
+    articulation_rate: float = Field(ge=0)
+
+
+class AcousticPauseMetrics(BaseModel):
+    pause_count: int = Field(ge=0)
+    long_pause_count: int = Field(ge=0)
+    longest_pause: float = Field(ge=0)
+    total_pause_time: float = Field(ge=0)
+    pause_ratio: float = Field(ge=0, le=1)
+
+
+class AcousticFillerMetrics(BaseModel):
+    count: int = Field(ge=0)
+
+
+class AcousticProsodyMetrics(BaseModel):
+    """Pitch values are Hz; energy_variation is a unitless ratio."""
+
+    pitch_median: float | None = Field(default=None, ge=0)
+    pitch_variation: float | None = Field(default=None, ge=0)
+    energy_variation: float | None = Field(default=None, ge=0)
+
+
+class AcousticMetrics(BaseModel):
+    duration_seconds: float = Field(ge=0)
+    speech: AcousticSpeechMetrics
+    pauses: AcousticPauseMetrics
+    fillers: AcousticFillerMetrics
+    prosody: AcousticProsodyMetrics
+    source: str = "transcript"
+
+
+class ListenRepeatResponse(BaseModel):
+    transcript: str
+    score: int = Field(ge=1, le=5)
+    score_summary: str
+    words: list[ComparisonWord]
+    feedback: FeedbackBlock
+    duration_seconds: float | None = None
+    mime_type: str | None = None
+    file_size_bytes: int | None = None
+    delivery_score: float | None = Field(default=None, ge=0, le=4)
+    language_use_score: float | None = Field(default=None, ge=0, le=4)
+    topic_development_score: float | None = Field(default=None, ge=0, le=4)
+    acoustic_metrics: AcousticMetrics | None = None
+    pronunciation_metrics: PronunciationMetrics | None = None
+    model: str = "python-api"
 
 
 class TranscriptSegmentIssue(BaseModel):
@@ -324,6 +365,7 @@ class InterviewResponse(BaseModel):
     transcript_segments: list[TranscriptSegmentFeedback] = Field(default_factory=list)
     pace_feedback: DeliveryFeedbackBlock | None = None
     pronunciation_feedback: DeliveryFeedbackBlock | None = None
+    acoustic_metrics: AcousticMetrics | None = None
     pronunciation_metrics: PronunciationMetrics | None = None
     scores: InterviewScores
     score_summary: str
@@ -573,23 +615,55 @@ def behavior_features_from_transcription(
     *,
     duration_hint: float | None = None,
     audio_bytes: bytes | None = None,
+    content_type: str | None = None,
 ) -> AudioFeatures:
-    """WPM / pauses / fillers from transcript timestamps — no Librosa decode."""
-    features = features_from_transcription(
-        transcription.transcript,
-        words=transcription.words,
-        duration_seconds=transcription.duration,
-        duration_hint=duration_hint,
-        audio_bytes=audio_bytes,
-    )
+    """Return legacy behavior metrics plus active waveform analysis when possible."""
+    if audio_bytes:
+        features = analyze_audio_features(
+            audio_bytes,
+            transcription.transcript,
+            words=transcription.words,
+            content_type=content_type,
+            duration_hint=duration_hint or transcription.duration,
+        )
+    else:
+        features = features_from_transcription(
+            transcription.transcript,
+            words=transcription.words,
+            duration_seconds=transcription.duration,
+            duration_hint=duration_hint,
+            audio_bytes=audio_bytes,
+        )
     logger.info(
-        "Transcript metrics wpm=%s pauses=%s fillers=%s duration=%ss",
+        "Acoustic metrics source=%s wpm=%s pauses=%s fillers=%s duration=%ss",
+        features.analysis_source,
         features.wpm,
         features.pause_count,
         features.filler_count,
         features.duration_seconds,
     )
     return features
+
+
+def acoustic_to_response(features: AudioFeatures) -> AcousticMetrics:
+    return AcousticMetrics(**acoustic_metrics_to_dict(features))
+
+
+async def analyze_behavior_features(
+    transcription: TranscriptResult,
+    *,
+    duration_hint: float | None = None,
+    audio_bytes: bytes | None = None,
+    content_type: str | None = None,
+) -> AudioFeatures:
+    """Run librosa/ffmpeg work off FastAPI's event loop."""
+    return await asyncio.to_thread(
+        behavior_features_from_transcription,
+        transcription,
+        duration_hint=duration_hint,
+        audio_bytes=audio_bytes,
+        content_type=content_type,
+    )
 
 
 def features_to_metrics(features: AudioFeatures) -> BehaviorMetrics:
@@ -809,7 +883,9 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
             )
         raise HTTPException(status_code=422, detail="Empty transcript.")
 
-    features = behavior_features_from_transcription(transcription, audio_bytes=audio_bytes)
+    features = await analyze_behavior_features(
+        transcription, audio_bytes=audio_bytes, content_type=content_type
+    )
     words_raw = build_word_comparison(body.reference_text, transcript)
     word_stats = word_stats_from_comparison(words_raw)
     pronunciation = await evaluate_speech(
@@ -828,6 +904,7 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
             prompt_id=body.prompt_id,
             metrics=features_to_dict(features),
             word_stats=word_stats,
+            acoustic_metrics=acoustic_metrics_to_dict(features),
             pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
     except ValueError as exc:
@@ -865,6 +942,7 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
         delivery_score=delivery,
         language_use_score=language,
         topic_development_score=topic,
+        acoustic_metrics=acoustic_to_response(features),
         pronunciation_metrics=pronunciation_to_response(pronunciation),
         model=model_with_providers(transcription.model, glm_model, pronunciation),
     )
@@ -892,10 +970,11 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
                 detail="Empty transcript. Speak clearly and try recording again.",
             )
 
-    features = behavior_features_from_transcription(
+    features = await analyze_behavior_features(
         transcription,
         duration_hint=body.duration_ms / 1000 if body.duration_ms > 0 else None,
         audio_bytes=audio_bytes,
+        content_type=content_type,
     )
     pronunciation = await evaluate_speech(
         audio_bytes,
@@ -913,6 +992,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
             response_seconds=body.response_seconds,
             metrics=features_to_dict(features),
             hesitation_event=detect_hesitation(transcription.words),
+            acoustic_metrics=acoustic_metrics_to_dict(features),
             pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
     except ValueError as exc:
@@ -942,6 +1022,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         transcript_segments=segments,
         pace_feedback=_delivery_from_dict(pace_raw),
         pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
+        acoustic_metrics=acoustic_to_response(features),
         pronunciation_metrics=pronunciation_to_response(pronunciation),
         scores=InterviewScores(
             topic=scores_raw.get("topic", 1),
@@ -1184,12 +1265,13 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
         if not transcript:
             raise HTTPException(status_code=422, detail="Empty transcript.")
 
-        features = behavior_features_from_transcription(
+        features = await analyze_behavior_features(
             transcription,
             duration_hint=body.duration_ms / 1000 if body.duration_ms > 0 else None,
             audio_bytes=audio_bytes,
+            content_type=content_type,
         )
-        timer.mark("audio_features", "Transcript metrics (WPM / pauses / fillers)")
+        timer.mark("audio_features", "Acoustic metrics (waveform/fallback)")
         pronunciation = await evaluate_speech(
             audio_bytes,
             content_type,
@@ -1206,6 +1288,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             response_seconds=body.response_seconds,
             metrics=features_to_dict(features),
             hesitation_event=detect_hesitation(transcription.words),
+            acoustic_metrics=acoustic_metrics_to_dict(features),
             pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
         timer.mark("build_prompt", "Build GLM scoring prompt")
@@ -1234,6 +1317,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             transcript_segments=segments,
             pace_feedback=_delivery_from_dict(pace_raw),
             pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
+            acoustic_metrics=acoustic_to_response(features),
             pronunciation_metrics=pronunciation_to_response(pronunciation),
             scores=InterviewScores(
                 topic=scores_raw.get("topic", 1),
@@ -1309,11 +1393,12 @@ async def _run_listen_repeat_timed(
                 raise HTTPException(status_code=503, detail="Transcription not configured.")
             raise HTTPException(status_code=422, detail="Empty transcript.")
 
-        features = behavior_features_from_transcription(
+        features = await analyze_behavior_features(
             transcription,
             audio_bytes=audio_bytes,
+            content_type=content_type,
         )
-        timer.mark("audio_features", "Transcript metrics (WPM / pauses / fillers)")
+        timer.mark("audio_features", "Acoustic metrics (waveform/fallback)")
         pronunciation = await evaluate_speech(
             audio_bytes,
             content_type,
@@ -1334,6 +1419,7 @@ async def _run_listen_repeat_timed(
             prompt_id=item.prompt_id,
             metrics=features_to_dict(features),
             word_stats=word_stats,
+            acoustic_metrics=acoustic_metrics_to_dict(features),
             pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
         timer.mark("build_prompt", "Build GLM scoring prompt")
@@ -1364,6 +1450,7 @@ async def _run_listen_repeat_timed(
             delivery_score=delivery,
             language_use_score=language,
             topic_development_score=topic,
+            acoustic_metrics=acoustic_to_response(features),
             pronunciation_metrics=pronunciation_to_response(pronunciation),
             model=model_with_providers(transcription.model, glm_model, pronunciation),
         )

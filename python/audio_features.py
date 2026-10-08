@@ -10,13 +10,12 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import Sequence
 
 import librosa
 import numpy as np
 
-if TYPE_CHECKING:
-    from whisper_transcribe import WhisperWord
+from providers.asr.base import TranscriptWord
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +25,15 @@ FILLER_PATTERN = re.compile(
 )
 
 DEFAULT_MIN_PAUSE_SECONDS = 0.3
+DEFAULT_LONG_PAUSE_SECONDS = 1.0
 DEFAULT_SILENCE_THRESHOLD_DB = -40.0
-DEFAULT_FRAME_LENGTH = 2048
-DEFAULT_HOP_LENGTH = 512
+# 20 ms RMS windows with 10 ms hops at the analysis sample rate. Pitch needs
+# longer windows and is calculated independently from this silence envelope.
+DEFAULT_SAMPLE_RATE = 16_000
+DEFAULT_FRAME_LENGTH = 320
+DEFAULT_HOP_LENGTH = 160
+DEFAULT_PITCH_FRAME_LENGTH = 2048
+MIN_RMS = 1e-4
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,15 @@ class AudioFeatures:
     filler_count: int
     duration_seconds: float
     word_count: int
+    articulation_rate: float = 0.0
+    long_pause_count: int = 0
+    total_pause_time: float = 0.0
+    pause_ratio: float = 0.0
+    pitch_median: float | None = None
+    pitch_variation: float | None = None
+    energy_variation: float | None = None
+    analysis_source: str = "transcript"
+    speech_duration_seconds: float | None = None
 
 
 def _count_fillers(transcript: str) -> int:
@@ -66,8 +80,8 @@ def _estimate_duration_seconds(
     word_count: int,
     duration_hint: float | None = None,
 ) -> float:
-    if duration_hint and duration_hint > 0:
-        return round(duration_hint, 2)
+    if _positive_number(duration_hint):
+        return max(0.1, round(float(duration_hint), 2))
     if audio_bytes and len(audio_bytes) > 0:
         # Rough estimate for compressed browser speech (webm/opus).
         return max(1.0, round(len(audio_bytes) / 12_000, 2))
@@ -79,33 +93,13 @@ def _fallback_features(
     *,
     audio_bytes: bytes | None = None,
     duration_hint: float | None = None,
+    words: Sequence[TranscriptWord] | None = None,
 ) -> AudioFeatures:
-    text = transcript.strip()
-    tokens = [t for t in text.split() if t]
-    word_count = len(tokens)
-    filler_count = _count_fillers(text)
-    duration_seconds = _estimate_duration_seconds(
-        audio_bytes, word_count, duration_hint
-    )
-    duration_min = duration_seconds / 60.0
-    wpm = round(word_count / duration_min, 1) if word_count else 0.0
-
-    punctuation_pauses = len(re.findall(r"[,;:.!?…]", text))
-    pause_count = max(0, punctuation_pauses + filler_count)
-    longest_pause = round(min(duration_seconds * 0.4, max(0.3, filler_count * 0.5)), 2)
-
     logger.warning(
-        "Using transcript-based audio metrics fallback "
-        "(webm decode unavailable — install ffmpeg for full Librosa analysis)."
+        "Using transcript-based estimates; waveform/prosody measurements unavailable."
     )
-
-    return AudioFeatures(
-        wpm=wpm,
-        pause_count=pause_count,
-        longest_pause=longest_pause,
-        filler_count=filler_count,
-        duration_seconds=duration_seconds,
-        word_count=word_count,
+    return features_from_transcription(
+        transcript, words=words, audio_bytes=audio_bytes, duration_hint=duration_hint
     )
 
 
@@ -177,6 +171,9 @@ def _load_audio_bytes(
                 "librosa load failed after ffmpeg for %s: %s", suffix, exc
             )
 
+    # Failure never returns temp_paths to the caller, so cleanup belongs here.
+    for path in temp_paths:
+        path.unlink(missing_ok=True)
     if decode_error is not None:
         raise decode_error
     raise RuntimeError("Failed to decode audio bytes")
@@ -194,7 +191,7 @@ def _load_audio(
     Returns (waveform, sr, temp_paths). Caller must unlink temp_paths when set.
     """
     if isinstance(audio, np.ndarray):
-        sr = sample_rate or 16_000
+        sr = sample_rate or DEFAULT_SAMPLE_RATE
         return audio, sr, []
 
     if isinstance(audio, bytes):
@@ -221,50 +218,134 @@ def _detect_pauses_from_audio(
     rms = librosa.feature.rms(
         y=y, frame_length=frame_length, hop_length=hop_length
     )[0]
+    rms = np.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0)
     if rms.size == 0:
         return []
 
     max_rms = float(np.max(rms))
-    if max_rms <= 0:
+    if max_rms < MIN_RMS:
         return []
 
     db = librosa.amplitude_to_db(rms, ref=max_rms)
     silent = db < silence_threshold_db
-    times = librosa.frames_to_time(
-        np.arange(len(silent)), sr=sr, hop_length=hop_length
-    )
+    voiced = np.flatnonzero(~silent)
+    if voiced.size < 2:
+        # A completely silent recording has no internal pause. Its duration is
+        # still reported by the caller, but it must not become one giant pause.
+        return []
 
     pauses: list[float] = []
+    first_voiced = int(voiced[0])
+    last_voiced = int(voiced[-1])
     in_pause = False
-    pause_start = 0.0
-
-    for idx, is_silent in enumerate(silent):
-        current_time = float(times[idx])
-        if is_silent and not in_pause:
-            pause_start = current_time
+    pause_start = 0
+    for idx in range(first_voiced, last_voiced + 1):
+        if silent[idx] and not in_pause:
+            pause_start = idx
             in_pause = True
-        elif not is_silent and in_pause:
-            duration = current_time - pause_start
+        elif not silent[idx] and in_pause:
+            duration = (idx - pause_start) * hop_length / sr
             if duration >= min_pause_duration:
                 pauses.append(duration)
             in_pause = False
 
-    if in_pause and len(times) > 0:
-        duration = float(times[-1]) - pause_start
-        if duration >= min_pause_duration:
-            pauses.append(duration)
-
     return pauses
 
 
-def _has_word_timing(word: "WhisperWord") -> bool:
-    return (isinstance(word.start, (int, float)) and isinstance(word.end, (int, float))
+def _prosody_from_audio(
+    y: np.ndarray,
+    sr: int,
+    *,
+    frame_length: int = DEFAULT_PITCH_FRAME_LENGTH,
+    hop_length: int = DEFAULT_HOP_LENGTH,
+) -> tuple[float | None, float | None, float | None]:
+    """Return pitch median, pitch spread, and relative RMS variation."""
+    if y.size == 0 or not np.any(np.abs(y) > 0):
+        return None, None, None
+
+    rms = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    finite_rms = rms[np.isfinite(rms) & (rms > 0)]
+    max_rms = float(np.max(finite_rms)) if finite_rms.size else 0.0
+    if max_rms < MIN_RMS:
+        return None, None, None
+    rms_floor = max_rms * 10 ** (DEFAULT_SILENCE_THRESHOLD_DB / 20)
+    voiced_rms = finite_rms[finite_rms >= rms_floor] if rms_floor else finite_rms
+    energy_variation = None
+    if voiced_rms.size:
+        energy_variation = round(
+            float(np.std(voiced_rms) / max(float(np.mean(voiced_rms)), 1e-8)), 3
+        )
+
+    pitch_median = None
+    pitch_variation = None
+    try:
+        fmax = min(500.0, max(100.0, sr / 2.0 - 1.0))
+        pitches = librosa.yin(
+            y,
+            fmin=75.0,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+        frame_mask = np.isfinite(rms) & (rms >= rms_floor)
+        usable = min(len(pitches), len(frame_mask))
+        pitches = pitches[:usable]
+        frame_mask = frame_mask[:usable]
+        voiced = pitches[
+            frame_mask & np.isfinite(pitches) & (pitches >= 75.0) & (pitches <= fmax)
+        ]
+        if voiced.size:
+            pitch_median = round(float(np.median(voiced)), 1)
+            pitch_variation = round(float(np.std(voiced)), 1)
+    except Exception as exc:
+        logger.debug("Pitch analysis failed: %s", exc)
+
+    return pitch_median, pitch_variation, energy_variation
+
+
+def _positive_number(value: object) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def _voiced_span_seconds(
+    y: np.ndarray,
+    sr: int,
+    *,
+    silence_threshold_db: float = DEFAULT_SILENCE_THRESHOLD_DB,
+    frame_length: int = DEFAULT_FRAME_LENGTH,
+    hop_length: int = DEFAULT_HOP_LENGTH,
+) -> float:
+    """Return the voiced envelope span, excluding leading/trailing silence."""
+    if y.size == 0:
+        return 0.0
+    rms = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    rms = np.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0)
+    max_rms = float(np.max(rms)) if rms.size else 0.0
+    if max_rms < MIN_RMS:
+        return 0.0
+    floor = max_rms * 10 ** (silence_threshold_db / 20)
+    voiced = np.flatnonzero(rms >= max(floor, MIN_RMS))
+    if voiced.size == 0:
+        return 0.0
+    span = (int(voiced[-1]) - int(voiced[0]) + 1) * hop_length / sr
+    return min(float(len(y) / sr), max(0.0, span))
+
+
+def _has_word_timing(word: TranscriptWord) -> bool:
+    return (not isinstance(word.start, bool) and not isinstance(word.end, bool)
+            and isinstance(word.start, (int, float)) and isinstance(word.end, (int, float))
             and math.isfinite(word.start) and math.isfinite(word.end)
             and 0 <= word.start < word.end)
 
 
 def _detect_pauses_from_word_gaps(
-    words: Sequence["WhisperWord"],
+    words: Sequence[TranscriptWord],
     *,
     min_pause_duration: float = DEFAULT_MIN_PAUSE_SECONDS,
 ) -> list[float]:
@@ -285,16 +366,16 @@ def _resolve_duration_seconds(
     *,
     duration_seconds: float | None = None,
     duration_hint: float | None = None,
-    words: Sequence["WhisperWord"] | None = None,
+    words: Sequence[TranscriptWord] | None = None,
     audio_bytes: bytes | None = None,
 ) -> float:
     """Pick the best available duration without decoding audio."""
-    if duration_hint and duration_hint > 0:
-        return round(duration_hint, 2)
-    if duration_seconds and duration_seconds > 0:
-        return round(float(duration_seconds), 2)
+    if _positive_number(duration_hint):
+        return max(0.1, round(float(duration_hint), 2))
+    if _positive_number(duration_seconds):
+        return max(0.1, round(float(duration_seconds), 2))
 
-    timed = [w for w in (words or []) if w.start is not None and w.end is not None]
+    timed = [w for w in (words or []) if _has_word_timing(w)]
     if len(timed) >= 2:
         span = float(timed[-1].end) - float(timed[0].start)  # type: ignore[arg-type]
         if span > 0:
@@ -308,7 +389,7 @@ def _resolve_duration_seconds(
 def features_from_transcription(
     transcript: str,
     *,
-    words: Sequence["WhisperWord"] | None = None,
+    words: Sequence[TranscriptWord] | None = None,
     duration_seconds: float | None = None,
     duration_hint: float | None = None,
     audio_bytes: bytes | None = None,
@@ -350,6 +431,8 @@ def features_from_transcription(
 
     duration_min = duration / 60.0
     wpm = round(word_count / duration_min, 1) if word_count else 0.0
+    total_pause_time = round(sum(pauses), 2)
+    speech_duration = max(duration - total_pause_time, 0.1)
 
     return AudioFeatures(
         wpm=wpm,
@@ -358,6 +441,11 @@ def features_from_transcription(
         filler_count=filler_count,
         duration_seconds=round(duration, 2),
         word_count=word_count,
+        articulation_rate=round(word_count / (speech_duration / 60.0), 1) if word_count else 0.0,
+        long_pause_count=sum(pause >= DEFAULT_LONG_PAUSE_SECONDS for pause in pauses),
+        total_pause_time=total_pause_time,
+        pause_ratio=round(min(total_pause_time / duration, 1.0), 3),
+        analysis_source="transcript",
     )
 
 
@@ -365,7 +453,7 @@ def analyze_audio_features(
     audio: str | Path | bytes | np.ndarray,
     transcript: str,
     *,
-    words: Sequence["WhisperWord"] | None = None,
+    words: Sequence[TranscriptWord] | None = None,
     sample_rate: int | None = None,
     content_type: str | None = None,
     duration_hint: float | None = None,
@@ -395,6 +483,7 @@ def analyze_audio_features(
             transcript,
             audio_bytes=audio_bytes,
             duration_hint=duration_hint,
+            words=words,
         )
 
     try:
@@ -411,17 +500,19 @@ def analyze_audio_features(
             min_pause_duration=min_pause_duration,
             silence_threshold_db=silence_threshold_db,
         )
-        if audio_pauses:
-            pauses = audio_pauses
-        elif words:
-            pauses = _detect_pauses_from_word_gaps(
-                words, min_pause_duration=min_pause_duration
-            )
-        else:
-            pauses = []
+        # A successfully decoded recording is authoritative, including when
+        # it contains no detectable internal silence. Timestamp gaps are used
+        # only by the transcript fallback path after decode failure.
+        pauses = audio_pauses
 
         pause_count = len(pauses)
         longest_pause = round(max(pauses), 2) if pauses else 0.0
+        total_pause_time = round(sum(pauses), 2)
+        pause_ratio = round(min(total_pause_time / duration_seconds, 1.0), 3)
+        voiced_span = _voiced_span_seconds(y, sr, silence_threshold_db=silence_threshold_db)
+        speech_duration = max(voiced_span - total_pause_time, 0.1)
+        articulation_rate = round(word_count / (speech_duration / 60.0), 1) if word_count else 0.0
+        pitch_median, pitch_variation, energy_variation = _prosody_from_audio(y, sr)
 
         duration_min = duration_seconds / 60.0
         wpm = round(word_count / duration_min, 1) if word_count else 0.0
@@ -433,7 +524,42 @@ def analyze_audio_features(
             filler_count=filler_count,
             duration_seconds=round(duration_seconds, 2),
             word_count=word_count,
+            articulation_rate=articulation_rate,
+            long_pause_count=sum(pause >= DEFAULT_LONG_PAUSE_SECONDS for pause in pauses),
+            total_pause_time=total_pause_time,
+            pause_ratio=pause_ratio,
+            pitch_median=pitch_median,
+            pitch_variation=pitch_variation,
+            energy_variation=energy_variation,
+            analysis_source="waveform",
+            speech_duration_seconds=round(speech_duration, 2),
         )
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
+
+
+def acoustic_metrics_to_dict(features: AudioFeatures) -> dict[str, object]:
+    """Serialize acoustic metrics without exposing decoder/provider internals."""
+    return {
+        "duration_seconds": features.duration_seconds,
+        "speech": {
+            "word_count": features.word_count,
+            "wpm": features.wpm,
+            "articulation_rate": features.articulation_rate,
+        },
+        "pauses": {
+            "pause_count": features.pause_count,
+            "long_pause_count": features.long_pause_count,
+            "longest_pause": features.longest_pause,
+            "total_pause_time": features.total_pause_time,
+            "pause_ratio": features.pause_ratio,
+        },
+        "fillers": {"count": features.filler_count},
+        "prosody": {
+            "pitch_median": features.pitch_median,
+            "pitch_variation": features.pitch_variation,
+            "energy_variation": features.energy_variation,
+        },
+        "source": features.analysis_source,
+    }

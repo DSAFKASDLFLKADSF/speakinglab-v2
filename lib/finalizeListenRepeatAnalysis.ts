@@ -10,6 +10,7 @@ import {
   computeListenRepeatScore,
 } from "@/lib/wordDiff";
 import { mapPronunciationMetrics } from "@/lib/pronunciationMetrics";
+import { mapAcousticMetrics } from "@/lib/acousticMetrics";
 
 function clampListenRepeatScore(value: number): ListenRepeatScore {
   const rounded = Math.round(value);
@@ -139,6 +140,7 @@ export async function finalizeListenRepeatAnalysis(
     scoreSummary,
     words,
     feedback,
+    acousticMetrics: mapAcousticMetrics(pythonResult.acoustic_metrics),
     pronunciationMetrics: mapPronunciationMetrics(pythonResult.pronunciation_metrics),
     storagePath,
     persisted,
