@@ -1,0 +1,77 @@
+本地启动与“没有反馈”排查
+
+V2.1 补充（2026-10-02）
+
+本机已验证的修复版目录：work/project。旧的 outputs/AI speaking trainer 是另一份代码。
+如果 3000 已被旧版占用，请指定新端口，不要把旧页面误认为修复版：
+  macOS / Linux: PORT=3001 npm run dev:all
+  PowerShell: $env:PORT="3001"; npm run dev:all
+此时打开 http://localhost:3001/dashboard。
+dev:all 会同步设置前端、播放地址和 Python 下载录音的内部地址。
+本次会话使用 8001 作为 Python API 端口；如需复现可设置 PYTHON_SPEECH_API_URL=http://127.0.0.1:8001。
+不要复用加载旧代码的 Python 进程；更新 Python 文件后需重启该服务。
+
+开发缓存现在是 .next-dev，生产构建仍是 .next，互不覆盖。
+npm run dev:clean 只清理开发缓存；端口占用时 dev:all 会明确停止，不会悄悄换端口。
+macOS 的 dev:all 默认使用轮询监视文件，避免文件监视器耗尽造成路由 404。
+
+完整检查：
+  npm test
+  npm run typecheck
+  npm run lint
+  npm run build
+  .venv/bin/python -m unittest discover -s python/tests -v
+Windows 最后一行改用 .venv\Scripts\python.exe。
+首次生产构建需要访问 Google Fonts 下载 Inter 字体。
+
+2026-10-02 的实际检查：上传、播放、AssemblyAI 转写均成功；GLM 返回 HTTP 429。
+进一步读取其错误体，确认为错误码 1113：“余额不足或无可用资源包,请充值。”
+旧代码误将它显示为“限流，请稍后重试”；现在会显示评分账户无可用额度，并立即停止自动重试。
+页面保留录音并显示分析失败，不会补出假的 1 分或 0 分。
+必须由账户所有者恢复智谱可用额度后才能生成真实 AI 反馈；单纯等待或重复点击不能解决余额不足。
+
+
+本项目有两个服务：Next.js 前端 + Python 评分/反馈 API。
+npm run dev 只启动前端。页面出现“analysis service could not be reached”时，不代表得了零分，而是尚未完成分析。
+
+1. 保留原配置
+   将原项目根目录的 .env.local，以及原项目 python/.env，放回新源码的相同位置。
+   发布的源码包不包含这些私有文件。无需把密钥发给任何人。
+   原始 AI speaking trainer (2).zip 中这两个配置文件都存在。
+   本地前端通常配置：PYTHON_SPEECH_API_URL=http://127.0.0.1:8000
+   python/.env 需要原有 AssemblyAI（或 Whisper）与 GLM 配置。
+
+2. 首次安装依赖（Python 3.10+）
+   在项目根目录运行：
+     npm ci
+
+   macOS / Linux：
+     python3 -m venv .venv
+     .venv/bin/python -m pip install -r python/requirements.txt
+
+   Windows：
+     py -3 -m venv .venv
+     .venv\Scripts\python.exe -m pip install -r python\requirements.txt
+
+3. 关闭旧的前端开发进程，在项目根目录运行：
+     npm run dev:all
+
+   新入口先检查 Python /health；服务尚未启动时，在 python 目录启动 uvicorn，使现有 python/.env 被正常读取。
+   评分服务可达后才启动前端。已有正确的评分服务会被复用，不会被新入口停止。
+   保持该终端运行。Ctrl+C 停止这个入口启动的服务。
+   如需指定已安装依赖的 Python，可通过 SPEECH_PYTHON 环境变量给出解释器路径。
+
+4. 回到当前考试页，点击 Retry scoring。
+   已保存录音可以继续使用；不要先点 Try again，也不要清空当前考试数据。
+
+如果是部署网站：
+   不使用 dev:all 作为生产启动命令。应分别部署/启动原有 Next.js 与 Python 服务。
+   Next.js 的 PYTHON_SPEECH_API_URL 要指向它能访问的 Python 服务地址；分开部署时不能简单照搬 localhost:8000。
+   保留原部署方式、服务密钥和音频访问配置。
+   服务健康检查只证明应用可达；实际反馈仍要求转写和评分 API 的配置有效。
+
+页面变化：
+   每道题以 Question 1–4 分组，题型不作为反馈维度标题。
+   详细反馈只使用两个指定标准作为正式标题；首题默认展开。
+   原有完整分数保存在 View all scoring dimensions 折叠区，计算方法未改。
+   所有分析失败时显示暂无评分和反馈，不显示 0.0/6；失败题仍可播放原录音。

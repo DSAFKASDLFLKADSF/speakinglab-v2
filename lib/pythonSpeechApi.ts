@@ -1,0 +1,414 @@
+import type { InterviewFeedback } from "@/lib/interviewDetailedFeedback";
+import type { ComparisonWord } from "@/components/ComparisonText";
+import type { FeedbackSection } from "@/components/FeedbackCard";
+import type { InterviewScores } from "@/components/InterviewScoreCard";
+import { rewriteAudioUrlForPythonFetch } from "@/lib/audioStorage";
+
+/** Payload sent to the Python speech analysis service. */
+export interface PythonAnalyzeSpeechRequest {
+  audio_url: string;
+  reference_text: string;
+  prompt_id?: string;
+  storage_path?: string;
+}
+
+/** Payload for Python Virtual Interview analysis. */
+export interface PythonAnalyzeInterviewRequest {
+  audio_url: string;
+  prompt: string;
+  question_id?: string;
+  storage_path?: string;
+  response_seconds?: number;
+  duration_ms?: number;
+}
+
+/** Raw response from the Python speech analysis service. */
+export interface PythonAnalyzeSpeechResponse {
+  transcript: string;
+  score?: number;
+  score_summary?: string;
+  words?: ComparisonWord[];
+  feedback?: {
+    summary: string;
+    sections: FeedbackSection[];
+  };
+  duration_seconds?: number;
+  mime_type?: string;
+  file_size_bytes?: number;
+  /** Optional ETS-style dimension scores (0–4) from Python */
+  delivery_score?: number;
+  language_use_score?: number;
+  topic_development_score?: number;
+  model?: string;
+}
+
+export interface PythonBehaviorMetrics {
+  speaking_rate_wpm: number;
+  pause_count: number;
+  filler_word_count: number;
+  longest_pause_seconds: number;
+}
+
+export interface PythonAnalyzeInterviewResponse {
+  transcript: string;
+  duration_seconds?: number | null;
+  transcript_segments?: Array<{
+    text: string;
+    has_issue: boolean;
+    topic_development?: {
+      what_needs_improvement: string;
+      why_it_matters: string;
+      knowledge_point?: string | null;
+    } | null;
+    grammar_vocabulary?: {
+      what_needs_improvement: string;
+      why_it_matters: string;
+      knowledge_point?: string | null;
+    } | null;
+    conciseness?: {
+      what_needs_improvement: string;
+      why_it_matters: string;
+      knowledge_point?: string | null;
+    } | null;
+    improved_version?: string;
+  }>;
+  /** @deprecated */
+  transcript_review?: Array<{
+    text: string;
+    kind: "grammar" | "improvement" | "strong";
+    note?: string;
+  }>;
+  pace_feedback?: { summary: string; suggestion?: string } | null;
+  pronunciation_feedback?: { summary: string; suggestion?: string } | null;
+  scores: InterviewScores;
+  score_summary: string;
+  metrics: PythonBehaviorMetrics;
+  feedback: InterviewFeedback;
+  model?: string;
+}
+
+export class PythonSpeechApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = "PythonSpeechApiError";
+  }
+}
+
+export function isInterviewAnalysisResult(value: unknown): value is PythonAnalyzeInterviewResponse {
+  if (!value || typeof value !== "object") return false;
+  const raw = value as PythonAnalyzeInterviewResponse;
+  return typeof raw.transcript === "string" && Boolean(raw.transcript.trim())
+    && ["topic", "pace", "pronunciation", "grammar"].every((key) => {
+      const score = raw.scores?.[key as keyof InterviewScores];
+      return typeof score === "number" && Number.isInteger(score) && score >= 1 && score <= 5;
+    })
+    && ["speaking_rate_wpm", "pause_count", "filler_word_count", "longest_pause_seconds"].every((key) => {
+      const metric = raw.metrics?.[key as keyof PythonBehaviorMetrics];
+      return typeof metric === "number" && Number.isFinite(metric) && metric >= 0;
+    });
+}
+
+export type PythonJobStatus = "pending" | "running" | "done" | "failed";
+
+export interface PythonJobStatusResponse {
+  job_id: string;
+  kind: "listen_repeat" | "interview";
+  status: PythonJobStatus;
+  error?: string | null;
+  result?: PythonAnalyzeSpeechResponse | PythonAnalyzeInterviewResponse | null;
+  client_result?: Record<string, unknown> | null;
+  request?: Record<string, unknown> | null;
+}
+
+export interface PythonJobCreatedResponse {
+  job_id: string;
+  status: "pending";
+}
+
+function getPythonApiConfig(options?: { timeoutMs?: number }) {
+  const baseUrl = process.env.PYTHON_SPEECH_API_URL?.trim();
+  if (!baseUrl) {
+    throw new Error(
+      "PYTHON_SPEECH_API_URL is not configured. Add it to .env.local (e.g. http://localhost:8000)."
+    );
+  }
+
+  return {
+    baseUrl: baseUrl.replace(/\/$/, ""),
+    apiKey: process.env.PYTHON_SPEECH_API_KEY?.trim(),
+    timeoutMs:
+      options?.timeoutMs ??
+      Number(process.env.PYTHON_SPEECH_API_TIMEOUT_MS ?? 300_000),
+  };
+}
+
+async function callPythonApi<T>(
+  path: string,
+  payload: unknown,
+  validate: (data: T) => boolean,
+  invalidMessage: string,
+  options?: { method?: "GET" | "POST" | "PUT"; timeoutMs?: number }
+): Promise<T> {
+  const { baseUrl, apiKey, timeoutMs } = getPythonApiConfig(options);
+  const method = options?.method ?? "POST";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+    };
+    if (method !== "GET") {
+      headers["Content-Type"] = "application/json";
+    }
+    if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+
+    const response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers,
+      body: method === "GET" ? undefined : JSON.stringify(payload),
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    if (response.status === 204 && method === "PUT") {
+      return undefined as T;
+    }
+
+    const data = (await response.json().catch(() => ({}))) as
+      | T
+      | { detail?: string; error?: string; message?: string };
+
+    if (!response.ok) {
+      const detail =
+        (data as { detail?: string }).detail ??
+        (data as { error?: string }).error ??
+        (data as { message?: string }).message ??
+        `Python API error (${response.status})`;
+      const message = typeof detail === "string" ? detail : "The analysis service rejected the request. Check the recording and question data.";
+      throw new PythonSpeechApiError(message, response.status);
+    }
+
+    if (validate && !validate(data as T)) {
+      throw new PythonSpeechApiError(invalidMessage, 502);
+    }
+
+    return data as T;
+  } catch (err) {
+    if (err instanceof PythonSpeechApiError) throw err;
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new PythonSpeechApiError(
+        `Python API request timed out after ${Math.round(timeoutMs / 1000)}s.`,
+        504
+      );
+    }
+    const message =
+      err instanceof Error ? err.message : "Failed to reach Python API.";
+    if (/fetch failed|ECONNREFUSED|Failed to fetch/i.test(message)) {
+      throw new PythonSpeechApiError(
+        `Cannot reach Python API at ${baseUrl}. Start it: cd python && uvicorn main:app --reload --port 8000`,
+        502
+      );
+    }
+    throw new PythonSpeechApiError(message, 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+const JOB_SUBMIT_TIMEOUT_MS = 30_000;
+const JOB_POLL_TIMEOUT_MS = 15_000;
+
+/** POST /jobs/listen-repeat — returns immediately with job_id */
+export async function createPythonListenRepeatJob(
+  payload: PythonAnalyzeSpeechRequest
+): Promise<PythonJobCreatedResponse> {
+  return callPythonApi<PythonJobCreatedResponse>(
+    "/jobs/listen-repeat",
+    {
+      ...payload,
+      audio_url: rewriteAudioUrlForPythonFetch(payload.audio_url),
+    },
+    (data) => typeof data?.job_id === "string" && Boolean(data.job_id),
+    "Python API returned an invalid job payload.",
+    { timeoutMs: JOB_SUBMIT_TIMEOUT_MS }
+  );
+}
+
+/** POST /jobs/interview — returns immediately with job_id */
+export async function createPythonInterviewJob(
+  payload: PythonAnalyzeInterviewRequest
+): Promise<PythonJobCreatedResponse> {
+  return callPythonApi<PythonJobCreatedResponse>(
+    "/jobs/interview",
+    {
+      ...payload,
+      audio_url: rewriteAudioUrlForPythonFetch(payload.audio_url),
+    },
+    (data) => typeof data?.job_id === "string" && Boolean(data.job_id),
+    "Python API returned an invalid job payload.",
+    { timeoutMs: JOB_SUBMIT_TIMEOUT_MS }
+  );
+}
+
+/** GET /jobs/{job_id} */
+export async function getPythonJobStatus(
+  jobId: string
+): Promise<PythonJobStatusResponse> {
+  return callPythonApi<PythonJobStatusResponse>(
+    `/jobs/${encodeURIComponent(jobId)}`,
+    {},
+    (data) => typeof data?.job_id === "string" && Boolean(data.job_id)
+      && ["pending", "running", "done", "failed"].includes(data.status)
+      && ["listen_repeat", "interview"].includes(data.kind),
+    "Python API returned an invalid job status payload.",
+    { method: "GET", timeoutMs: JOB_POLL_TIMEOUT_MS }
+  );
+}
+
+/** PUT /jobs/{job_id}/client-result — cache finalized Next.js response */
+export async function setPythonJobClientResult(
+  jobId: string,
+  clientResult: unknown
+): Promise<void> {
+  await callPythonApi<void>(
+    `/jobs/${encodeURIComponent(jobId)}/client-result`,
+    { client_result: clientResult },
+    () => true,
+    "",
+    { method: "PUT", timeoutMs: JOB_POLL_TIMEOUT_MS }
+  );
+}
+
+/**
+ * Call the Python Listen & Repeat analysis endpoint.
+ * Expected Python route: POST {PYTHON_SPEECH_API_URL}/analyze/listen-repeat
+ */
+export async function callPythonAnalyzeSpeech(
+  payload: PythonAnalyzeSpeechRequest
+): Promise<PythonAnalyzeSpeechResponse> {
+  return callPythonApi<PythonAnalyzeSpeechResponse>(
+    "/analyze/listen-repeat",
+    { ...payload, audio_url: rewriteAudioUrlForPythonFetch(payload.audio_url) },
+    (data) => Boolean((data as PythonAnalyzeSpeechResponse).transcript),
+    "Python API returned an invalid payload (missing transcript).",
+    { timeoutMs: Number(process.env.PYTHON_SPEECH_API_TIMEOUT_MS ?? 300_000) }
+  );
+}
+
+/**
+ * Call the Python Virtual Interview analysis endpoint.
+ * Expected Python route: POST {PYTHON_SPEECH_API_URL}/analyze/interview
+ */
+export async function callPythonAnalyzeInterview(
+  payload: PythonAnalyzeInterviewRequest
+): Promise<PythonAnalyzeInterviewResponse> {
+  return callPythonApi<PythonAnalyzeInterviewResponse>(
+    "/analyze/interview",
+    { ...payload, audio_url: rewriteAudioUrlForPythonFetch(payload.audio_url) },
+    isInterviewAnalysisResult,
+    "Python API returned an invalid interview payload.",
+    { timeoutMs: Number(process.env.PYTHON_SPEECH_API_TIMEOUT_MS ?? 300_000) }
+  );
+}
+
+export interface PythonBenchmarkStage {
+  id: string;
+  label: string;
+  seconds: number;
+}
+
+export interface PythonBenchmarkRunOneResponse {
+  kind: "interview" | "listen_repeat";
+  title: string;
+  success: boolean;
+  stages: PythonBenchmarkStage[];
+  total_seconds: number;
+  error?: string | null;
+  score_preview?: string | null;
+  result?: PythonBenchmarkInterviewResult | PythonBenchmarkListenRepeatResult | null;
+}
+
+export interface PythonBenchmarkInterviewResult {
+  transcript: string;
+  transcript_segments?: Array<{
+    text: string;
+    has_issue: boolean;
+    topic_development?: { what_needs_improvement: string; why_it_matters: string } | null;
+    grammar_vocabulary?: { what_needs_improvement: string; why_it_matters: string } | null;
+    conciseness?: { what_needs_improvement: string; why_it_matters: string } | null;
+    improved_version?: string;
+  }>;
+  pace_feedback?: { summary: string; suggestion?: string } | null;
+  pronunciation_feedback?: { summary: string; suggestion?: string } | null;
+  scores: {
+    topic: number;
+    pace: number;
+    pronunciation: number;
+    grammar: number;
+  };
+  score_summary: string;
+  metrics: {
+    speaking_rate_wpm: number;
+    pause_count: number;
+    filler_word_count: number;
+    longest_pause_seconds: number;
+  };
+  feedback: InterviewFeedback;
+  model?: string;
+}
+
+export interface PythonBenchmarkListenRepeatResult {
+  transcript: string;
+  score: number;
+  score_summary: string;
+  words?: Array<{
+    original: string | null;
+    spoken: string | null;
+    status: string;
+  }>;
+  feedback: {
+    summary: string;
+    sections: Array<{ title: string; content: string }>;
+  };
+  model?: string;
+}
+
+export interface PythonBenchmarkInterviewItem {
+  audio_url: string;
+  prompt: string;
+  question_id?: string;
+  response_seconds?: number;
+  duration_ms?: number;
+  title: string;
+}
+
+export interface PythonBenchmarkListenRepeatItem {
+  audio_url: string;
+  reference_text: string;
+  prompt_id?: string;
+  title: string;
+}
+
+export async function callPythonBenchmarkRunOne(payload: {
+  kind: "interview" | "listen_repeat";
+  interview?: PythonBenchmarkInterviewItem;
+  listen_repeat?: PythonBenchmarkListenRepeatItem;
+}): Promise<PythonBenchmarkRunOneResponse> {
+  return callPythonApi<PythonBenchmarkRunOneResponse>(
+    "/benchmark/run-one",
+    payload,
+    (data) =>
+      Boolean(
+        (data as PythonBenchmarkRunOneResponse).kind &&
+          Array.isArray((data as PythonBenchmarkRunOneResponse).stages)
+      ),
+    "Python benchmark returned an invalid payload.",
+    { timeoutMs: Number(process.env.PYTHON_SPEECH_API_TIMEOUT_MS ?? 300_000) }
+  );
+}
