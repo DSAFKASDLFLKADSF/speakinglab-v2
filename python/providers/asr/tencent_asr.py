@@ -7,20 +7,22 @@ service receives the normalized :class:`TranscriptResult` contract.
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
-import json
 import logging
 import math
 import os
 import time
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import urlparse
-
-import requests
 
 from .base import ASRProvider, ASRProviderError, TranscriptResult, TranscriptWord
+from ..tencent_cloud import (
+    TencentCloudClient,
+    TencentCloudError,
+    _hash as _cloud_hash,
+    _hmac as _cloud_hmac,
+    requests,  # Re-exported for compatibility with existing request tests.
+    tc3_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +39,15 @@ class TencentASRError(ASRProviderError):
 
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    """Compatibility wrapper for the shared Tencent signing helper."""
+
+    return _cloud_hash(value)
 
 
 def _sign(secret_key: str, message: str) -> bytes:
-    return hmac.new(secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
+    """Compatibility wrapper for the shared Tencent signing helper."""
+
+    return _cloud_hmac(secret_key, message)
 
 
 def _authorization(
@@ -54,24 +60,15 @@ def _authorization(
     payload: str,
     timestamp: int,
 ) -> str:
-    date = time.strftime("%Y-%m-%d", time.gmtime(timestamp))
-    signed_headers = "content-type;host"
-    canonical_headers = f"content-type:application/json; charset=utf-8\nhost:{host}\n"
-    canonical_request = "\n".join(
-        ["POST", "/", "", canonical_headers, signed_headers, _hash(payload)]
-    )
-    credential_scope = f"{date}/{SERVICE}/tc3_request"
-    string_to_sign = "\n".join(
-        ["TC3-HMAC-SHA256", str(timestamp), credential_scope, _hash(canonical_request)]
-    )
-    secret_date = _sign("TC3" + secret_key, date)
-    secret_service = hmac.new(secret_date, SERVICE.encode(), hashlib.sha256).digest()
-    secret_signing = hmac.new(secret_service, b"tc3_request", hashlib.sha256).digest()
-    signature = hmac.new(secret_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
-    return (
-        "TC3-HMAC-SHA256 "
-        f"Credential={secret_id}/{credential_scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
+    del action
+    return tc3_authorization(
+        secret_id=secret_id,
+        secret_key=secret_key,
+        region=region,
+        service=SERVICE,
+        host=host,
+        payload=payload,
+        timestamp=timestamp,
     )
 
 
@@ -182,6 +179,15 @@ class TencentASRProvider(ASRProvider):
         self.engine_model_type = (engine_model_type or os.getenv("TENCENT_ASR_ENGINE_MODEL_TYPE") or DEFAULT_ENGINE_MODEL_TYPE).strip()
         self.timeout = max(1.0, float(timeout))
         self.poll_interval = max(0.05, float(poll_interval))
+        self.client = TencentCloudClient(
+            secret_id=self.secret_id,
+            secret_key=self.secret_key,
+            region=self.region,
+            endpoint=self.endpoint,
+            service=SERVICE,
+            version=VERSION,
+            timeout=self.timeout,
+        )
 
     @classmethod
     def from_environment(cls) -> "TencentASRProvider":
@@ -195,48 +201,11 @@ class TencentASRProvider(ASRProvider):
             poll_interval=float(os.getenv("TENCENT_ASR_POLL_INTERVAL_SECONDS", "1")),
         )
 
-    def _ensure_credentials(self) -> None:
-        if not self.secret_id or not self.secret_key:
-            raise TencentASRError("TENCENT_SECRET_ID and TENCENT_SECRET_KEY are required for Tencent ASR.")
-
     def _request(self, action: str, body: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-        self._ensure_credentials()
-        payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-        parsed = urlparse(self.endpoint)
-        host = parsed.netloc
-        timestamp = int(time.time())
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Host": host,
-            "X-TC-Action": action,
-            "X-TC-Version": VERSION,
-            "X-TC-Timestamp": str(timestamp),
-            "X-TC-Region": self.region,
-            "Authorization": _authorization(
-                secret_id=self.secret_id,
-                secret_key=self.secret_key,
-                region=self.region,
-                host=host,
-                action=action,
-                payload=payload,
-                timestamp=timestamp,
-            ),
-        }
         try:
-            response = requests.post(self.endpoint, headers=headers, data=payload, timeout=timeout)
-            response.raise_for_status()
-            parsed_response = response.json()
-        except requests.RequestException as exc:
-            raise TencentASRError(f"Tencent ASR request failed: {exc}") from exc
-        except ValueError as exc:
-            raise TencentASRError("Tencent ASR returned invalid JSON.") from exc
-        if not isinstance(parsed_response, dict):
-            raise TencentASRError("Tencent ASR returned an invalid JSON object.")
-        api_error = parsed_response.get("Response", {}).get("Error")
-        if isinstance(api_error, dict):
-            message = api_error.get("Message") or api_error.get("Code") or "unknown error"
-            raise TencentASRError(f"Tencent ASR API error: {message}")
-        return parsed_response
+            return self.client.request(action, body, timeout=timeout)
+        except TencentCloudError as exc:
+            raise TencentASRError(str(exc)) from exc
 
     def _create_task(self, audio: bytes, *, audio_url: str | None, language: str) -> str:
         body: dict[str, Any] = {

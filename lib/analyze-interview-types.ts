@@ -1,6 +1,7 @@
 import type { BehaviorMetrics } from "@/components/BehaviorMetricsCard";
 import type { InterviewFeedback } from "@/lib/interviewDetailedFeedback";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
+import type { PronunciationMetrics } from "@/lib/pronunciationMetrics";
 
 export type { BehaviorMetrics };
 
@@ -55,6 +56,7 @@ export interface AnalyzeInterviewResponse {
   scoreSummary: string;
   metrics: BehaviorMetrics;
   feedback: InterviewFeedback;
+  pronunciationMetrics?: PronunciationMetrics;
   storagePath?: string;
   persisted?: boolean;
   sessionId?: string;

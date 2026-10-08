@@ -196,6 +196,7 @@ def _build_interview_user_payload(
     response_seconds: int,
     theme: str | None,
     metrics: dict[str, Any] | None,
+    pronunciation_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "task": "Virtual Interview",
@@ -211,6 +212,8 @@ def _build_interview_user_payload(
         payload["theme"] = theme
     if metrics:
         payload["behavior_metrics"] = metrics
+    if pronunciation_metrics:
+        payload["pronunciation_metrics"] = pronunciation_metrics
     return payload
 
 
@@ -221,6 +224,7 @@ def _build_listen_repeat_user_payload(
     prompt_id: str | None,
     word_stats: dict[str, Any] | None,
     metrics: dict[str, Any] | None,
+    pronunciation_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "task": "Listen and Repeat",
@@ -235,6 +239,8 @@ def _build_listen_repeat_user_payload(
         payload["word_stats"] = word_stats
     if metrics:
         payload["behavior_metrics"] = metrics
+    if pronunciation_metrics:
+        payload["pronunciation_metrics"] = pronunciation_metrics
     return payload
 
 
@@ -250,6 +256,7 @@ def get_toefl_score_prompt(
     response_seconds: int = 45,
     metrics: dict[str, Any] | None = None,
     word_stats: dict[str, Any] | None = None,
+    pronunciation_metrics: dict[str, Any] | None = None,
     hesitation_event: dict[str, Any] | None = None,
 ) -> ToeflScorePrompt:
     """
@@ -283,6 +290,7 @@ def get_toefl_score_prompt(
             response_seconds=response_seconds,
             theme=theme,
             metrics=metrics,
+            pronunciation_metrics=pronunciation_metrics,
         )
         user_payload["hesitation_event"] = hesitation_event
         schema = INTERVIEW_JSON_SCHEMA
@@ -296,6 +304,7 @@ def get_toefl_score_prompt(
             prompt_id=prompt_id,
             word_stats=word_stats,
             metrics=metrics,
+            pronunciation_metrics=pronunciation_metrics,
         )
         schema = LISTEN_REPEAT_JSON_SCHEMA
 

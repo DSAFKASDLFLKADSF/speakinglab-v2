@@ -9,6 +9,7 @@ import {
   buildWordComparison,
   computeListenRepeatScore,
 } from "@/lib/wordDiff";
+import { mapPronunciationMetrics } from "@/lib/pronunciationMetrics";
 
 function clampListenRepeatScore(value: number): ListenRepeatScore {
   const rounded = Math.round(value);
@@ -138,6 +139,7 @@ export async function finalizeListenRepeatAnalysis(
     scoreSummary,
     words,
     feedback,
+    pronunciationMetrics: mapPronunciationMetrics(pythonResult.pronunciation_metrics),
     storagePath,
     persisted,
     sessionId,

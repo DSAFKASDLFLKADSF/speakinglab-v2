@@ -20,7 +20,7 @@ Create a **Web Service** with:
 
 ## Environment variables
 
-Whisper（转写）与智谱 GLM（打分）使用独立配置。Listen & Repeat 与 Virtual Interview 均走 Python API。
+Tencent ASR（转写）、Tencent SOE（客观语音评估）与智谱 GLM（打分）使用独立配置。Listen & Repeat 与 Virtual Interview 均走 Python API。
 
 ### Required (production)
 
@@ -30,10 +30,19 @@ GLM_API_KEY=your_zhipu_api_key
 GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 MODEL_NAME=glm-4.7-flashx
 
-# AssemblyAI — 转写（Listen & Repeat + Virtual Interview）
-ASSEMBLYAI_API_KEY=your_assemblyai_key
-ASSEMBLYAI_BASE_URL=https://api.assemblyai.com
-ASSEMBLYAI_SPEECH_MODELS=universal-2
+# Tencent — 转写与语音评估
+ASR_PROVIDER=tencent
+SPEECH_EVAL_PROVIDER=tencent
+TENCENT_SECRET_ID=your_tencent_secret_id
+TENCENT_SECRET_KEY=your_tencent_secret_key
+TENCENT_REGION=ap-guangzhou
+TENCENT_ASR_ENGINE_MODEL_TYPE=16k_en
+TENCENT_SOE_ENDPOINT=https://soe.tencentcloudapi.com
+
+# Optional legacy ASR fallback
+# ASSEMBLYAI_API_KEY=your_assemblyai_key
+# ASSEMBLYAI_BASE_URL=https://api.assemblyai.com
+# ASSEMBLYAI_SPEECH_MODELS=universal-2
 
 # Next.js
 PYTHON_SPEECH_API_URL=http://localhost:8000
@@ -43,13 +52,14 @@ CORS_ORIGINS=https://your-next-app.onrender.com
 DEV_ECHO_REFERENCE=false
 ```
 
-### Local debug (score-only, skip transcription)
+### Local debug (credential-free)
 
-Only when **no** `ASSEMBLYAI_API_KEY` / `OPENAI_API_KEY`:
+Use deterministic local adapters to exercise the full workflow without cloud credentials:
 
 ```env
 GLM_API_KEY=your_zhipu_api_key
-DEV_ECHO_REFERENCE=true
+ASR_PROVIDER=mock
+SPEECH_EVAL_PROVIDER=mock
 ```
 
 ## Blueprint (Infrastructure as Code)

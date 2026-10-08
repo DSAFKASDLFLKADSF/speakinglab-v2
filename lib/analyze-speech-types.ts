@@ -1,6 +1,7 @@
 import type { ComparisonWord } from "@/components/ComparisonText";
 import type { FeedbackSection } from "@/components/FeedbackCard";
 import type { ListenRepeatScore } from "@/components/ScoreCard";
+import type { PronunciationMetrics } from "@/lib/pronunciationMetrics";
 
 export interface AnalyzeSpeechRequest {
   audioUrl: string;
@@ -18,6 +19,7 @@ export interface AnalyzeSpeechResponse {
     summary: string;
     sections: FeedbackSection[];
   };
+  pronunciationMetrics?: PronunciationMetrics;
   storagePath: string;
   persisted: boolean;
   sessionId?: string;

@@ -3,6 +3,7 @@ import type { ComparisonWord } from "@/components/ComparisonText";
 import type { FeedbackSection } from "@/components/FeedbackCard";
 import type { InterviewScores } from "@/components/InterviewScoreCard";
 import { rewriteAudioUrlForPythonFetch } from "@/lib/audioStorage";
+import type { PythonPronunciationMetrics } from "@/lib/pronunciationMetrics";
 
 /** Payload sent to the Python speech analysis service. */
 export interface PythonAnalyzeSpeechRequest {
@@ -39,6 +40,7 @@ export interface PythonAnalyzeSpeechResponse {
   delivery_score?: number;
   language_use_score?: number;
   topic_development_score?: number;
+  pronunciation_metrics?: PythonPronunciationMetrics | null;
   model?: string;
 }
 
@@ -84,6 +86,7 @@ export interface PythonAnalyzeInterviewResponse {
   score_summary: string;
   metrics: PythonBehaviorMetrics;
   feedback: InterviewFeedback;
+  pronunciation_metrics?: PythonPronunciationMetrics | null;
   model?: string;
 }
 

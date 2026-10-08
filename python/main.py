@@ -46,6 +46,15 @@ from providers.asr.factory import (
     is_provider_configured,
     resolve_provider_name,
 )
+from providers.speech_eval import (
+    PronunciationMetrics as NormalizedPronunciationMetrics,
+    SpeechEvaluationProviderError,
+)
+from providers.speech_eval.factory import (
+    create_speech_evaluation_provider,
+    is_speech_evaluation_configured as is_speech_eval_provider_configured,
+    resolve_speech_evaluation_provider_name,
+)
 from neural_tts import DEFAULT_RATE, DEFAULT_VOICE, synthesize_cached
 from analysis_jobs import AnalysisJob, job_store
 from analysis_timing import StageTimer
@@ -78,6 +87,28 @@ class Settings(BaseSettings):
     )
     mock_asr_duration_seconds: float = Field(
         default=6.0, alias="MOCK_ASR_DURATION_SECONDS"
+    )
+    speech_eval_provider: str = Field(
+        default="none", alias="SPEECH_EVAL_PROVIDER"
+    )
+    tencent_soe_endpoint: str = Field(
+        default="https://soe.tencentcloudapi.com",
+        alias="TENCENT_SOE_ENDPOINT",
+    )
+    tencent_soe_timeout_seconds: float = Field(
+        default=120.0, alias="TENCENT_SOE_TIMEOUT_SECONDS"
+    )
+    tencent_soe_voice_file_type: int = Field(
+        default=1, alias="TENCENT_SOE_VOICE_FILE_TYPE"
+    )
+    tencent_soe_voice_encode_type: int = Field(
+        default=1, alias="TENCENT_SOE_VOICE_ENCODE_TYPE"
+    )
+    tencent_soe_eval_mode_free: int = Field(
+        default=0, alias="TENCENT_SOE_EVAL_MODE_FREE"
+    )
+    tencent_soe_eval_mode_reference: int = Field(
+        default=1, alias="TENCENT_SOE_EVAL_MODE_REFERENCE"
     )
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(
@@ -198,6 +229,23 @@ class ComparisonWord(BaseModel):
     user: str | None = None
 
 
+class PronunciationWord(BaseModel):
+    word: str
+    score: float | None = Field(default=None, ge=0, le=100)
+    status: str = "ok"
+    start: float | None = Field(default=None, ge=0)
+    end: float | None = Field(default=None, ge=0)
+
+
+class PronunciationMetrics(BaseModel):
+    pronunciation_accuracy: float | None = Field(default=None, ge=0, le=100)
+    pronunciation_fluency: float | None = Field(default=None, ge=0, le=100)
+    completeness: float | None = Field(default=None, ge=0, le=100)
+    words: list[PronunciationWord] = Field(default_factory=list)
+    provider: str
+    model: str
+
+
 class ListenRepeatRequest(BaseModel):
     audio_url: HttpUrl
     reference_text: str = Field(min_length=1)
@@ -217,6 +265,7 @@ class ListenRepeatResponse(BaseModel):
     delivery_score: float | None = Field(default=None, ge=0, le=4)
     language_use_score: float | None = Field(default=None, ge=0, le=4)
     topic_development_score: float | None = Field(default=None, ge=0, le=4)
+    pronunciation_metrics: PronunciationMetrics | None = None
     model: str = "python-api"
 
 
@@ -275,6 +324,7 @@ class InterviewResponse(BaseModel):
     transcript_segments: list[TranscriptSegmentFeedback] = Field(default_factory=list)
     pace_feedback: DeliveryFeedbackBlock | None = None
     pronunciation_feedback: DeliveryFeedbackBlock | None = None
+    pronunciation_metrics: PronunciationMetrics | None = None
     scores: InterviewScores
     score_summary: str
     metrics: BehaviorMetrics
@@ -436,6 +486,71 @@ async def transcribe_audio(
     except (ASRProviderError, requests.RequestException) as exc:
         logger.error("Transcription failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def evaluate_speech(
+    audio_bytes: bytes,
+    content_type: str | None,
+    transcription: TranscriptResult,
+    *,
+    mode: Literal["free_speaking", "reference"],
+    reference_text: str | None = None,
+) -> NormalizedPronunciationMetrics | None:
+    """Run optional objective pronunciation evaluation through one adapter."""
+
+    provider_name = resolve_speech_evaluation_provider_name(settings)
+    if provider_name == "none":
+        return None
+    if not is_speech_eval_provider_configured(settings):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Speech evaluation is not configured. Set "
+                "SPEECH_EVAL_PROVIDER=mock for local development or configure Tencent SOE."
+            ),
+        )
+
+    try:
+        provider = create_speech_evaluation_provider(settings)
+        result = await asyncio.to_thread(
+            provider.evaluate,
+            audio_bytes,
+            transcript=transcription,
+            mode=mode,
+            reference_text=reference_text,
+            content_type=content_type,
+        )
+        logger.info(
+            "Speech evaluation complete provider=%s accuracy=%s fluency=%s completeness=%s words=%s",
+            provider_name,
+            result.pronunciation_accuracy,
+            result.pronunciation_fluency,
+            result.completeness,
+            len(result.words),
+        )
+        return result
+    except SpeechEvaluationProviderError as exc:
+        logger.error("Speech evaluation failed provider=%s: %s", provider_name, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def pronunciation_to_response(
+    metrics: NormalizedPronunciationMetrics | None,
+) -> PronunciationMetrics | None:
+    if metrics is None:
+        return None
+    return PronunciationMetrics(**metrics.to_dict())
+
+
+def model_with_providers(
+    transcription_model: str,
+    glm_model: str,
+    pronunciation: NormalizedPronunciationMetrics | None,
+) -> str:
+    parts = [transcription_model, glm_model]
+    if pronunciation is not None:
+        parts.append(pronunciation.model)
+    return "+".join(part for part in parts if part)
 
 
 def _guess_extension(content_type: str | None) -> str:
@@ -697,6 +812,13 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
     features = behavior_features_from_transcription(transcription, audio_bytes=audio_bytes)
     words_raw = build_word_comparison(body.reference_text, transcript)
     word_stats = word_stats_from_comparison(words_raw)
+    pronunciation = await evaluate_speech(
+        audio_bytes,
+        content_type,
+        transcription,
+        mode="reference",
+        reference_text=body.reference_text,
+    )
 
     try:
         score_prompt = get_toefl_score_prompt(
@@ -706,6 +828,7 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
             prompt_id=body.prompt_id,
             metrics=features_to_dict(features),
             word_stats=word_stats,
+            pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
     except ValueError as exc:
         logger.warning("Invalid listen-repeat scoring prompt: %s", exc)
@@ -742,7 +865,8 @@ async def run_listen_repeat_analysis(body: ListenRepeatRequest) -> ListenRepeatR
         delivery_score=delivery,
         language_use_score=language,
         topic_development_score=topic,
-        model=f"{transcription.model}+{glm_model}",
+        pronunciation_metrics=pronunciation_to_response(pronunciation),
+        model=model_with_providers(transcription.model, glm_model, pronunciation),
     )
 
 
@@ -773,6 +897,12 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         duration_hint=body.duration_ms / 1000 if body.duration_ms > 0 else None,
         audio_bytes=audio_bytes,
     )
+    pronunciation = await evaluate_speech(
+        audio_bytes,
+        content_type,
+        transcription,
+        mode="free_speaking",
+    )
 
     try:
         score_prompt = get_toefl_score_prompt(
@@ -783,6 +913,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
             response_seconds=body.response_seconds,
             metrics=features_to_dict(features),
             hesitation_event=detect_hesitation(transcription.words),
+            pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
     except ValueError as exc:
         logger.warning("Invalid interview scoring prompt: %s", exc)
@@ -811,6 +942,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         transcript_segments=segments,
         pace_feedback=_delivery_from_dict(pace_raw),
         pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
+        pronunciation_metrics=pronunciation_to_response(pronunciation),
         scores=InterviewScores(
             topic=scores_raw.get("topic", 1),
             pace=scores_raw.get("pace", 1),
@@ -820,7 +952,7 @@ async def run_interview_analysis(body: InterviewRequest) -> InterviewResponse:
         score_summary=score_summary,
         metrics=features_to_metrics(features),
         feedback=InterviewFeedbackBlock(**feedback_raw),
-        model=f"{transcription.model}+{glm_model}",
+        model=model_with_providers(transcription.model, glm_model, pronunciation),
     )
 
 
@@ -1058,6 +1190,13 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             audio_bytes=audio_bytes,
         )
         timer.mark("audio_features", "Transcript metrics (WPM / pauses / fillers)")
+        pronunciation = await evaluate_speech(
+            audio_bytes,
+            content_type,
+            transcription,
+            mode="free_speaking",
+        )
+        timer.mark("speech_evaluation", "Pronunciation and fluency evaluation")
 
         score_prompt = get_toefl_score_prompt(
             task="interview",
@@ -1067,6 +1206,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             response_seconds=body.response_seconds,
             metrics=features_to_dict(features),
             hesitation_event=detect_hesitation(transcription.words),
+            pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
         timer.mark("build_prompt", "Build GLM scoring prompt")
 
@@ -1094,6 +1234,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             transcript_segments=segments,
             pace_feedback=_delivery_from_dict(pace_raw),
             pronunciation_feedback=_delivery_from_dict(pronunciation_raw),
+            pronunciation_metrics=pronunciation_to_response(pronunciation),
             scores=InterviewScores(
                 topic=scores_raw.get("topic", 1),
                 pace=scores_raw.get("pace", 1),
@@ -1103,7 +1244,7 @@ async def _run_interview_timed(item: BenchmarkInterviewItem) -> BenchmarkRunOneR
             score_summary=score_summary,
             metrics=features_to_metrics(features),
             feedback=InterviewFeedbackBlock(**feedback_raw),
-            model=f"{transcription.model}+{glm_model}",
+            model=model_with_providers(transcription.model, glm_model, pronunciation),
         )
 
         return BenchmarkRunOneResponse(
@@ -1173,6 +1314,14 @@ async def _run_listen_repeat_timed(
             audio_bytes=audio_bytes,
         )
         timer.mark("audio_features", "Transcript metrics (WPM / pauses / fillers)")
+        pronunciation = await evaluate_speech(
+            audio_bytes,
+            content_type,
+            transcription,
+            mode="reference",
+            reference_text=item.reference_text,
+        )
+        timer.mark("speech_evaluation", "Pronunciation and fluency evaluation")
 
         words_raw = build_word_comparison(item.reference_text, transcript)
         word_stats = word_stats_from_comparison(words_raw)
@@ -1185,6 +1334,7 @@ async def _run_listen_repeat_timed(
             prompt_id=item.prompt_id,
             metrics=features_to_dict(features),
             word_stats=word_stats,
+            pronunciation_metrics=pronunciation.to_dict() if pronunciation else None,
         )
         timer.mark("build_prompt", "Build GLM scoring prompt")
 
@@ -1214,7 +1364,8 @@ async def _run_listen_repeat_timed(
             delivery_score=delivery,
             language_use_score=language,
             topic_development_score=topic,
-            model=f"{transcription.model}+{glm_model}",
+            pronunciation_metrics=pronunciation_to_response(pronunciation),
+            model=model_with_providers(transcription.model, glm_model, pronunciation),
         )
 
         return BenchmarkRunOneResponse(

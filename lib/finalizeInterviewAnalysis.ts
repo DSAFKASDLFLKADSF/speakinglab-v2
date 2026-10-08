@@ -9,6 +9,7 @@ import { isInterviewAnalysisResult, PythonSpeechApiError } from "@/lib/pythonSpe
 import { saveInterviewAnalysis } from "@/lib/saveInterviewAnalysis";
 import { isDatabaseConfigured } from "@/lib/db";
 import { normalizeInterviewFeedback } from "@/lib/interviewDetailedFeedback";
+import { mapPronunciationMetrics } from "@/lib/pronunciationMetrics";
 
 function mapIssue(
   raw:
@@ -139,6 +140,7 @@ export async function finalizeInterviewAnalysis(
       longestPauseSeconds: pythonResult.metrics.longest_pause_seconds,
     },
     feedback,
+    pronunciationMetrics: mapPronunciationMetrics(pythonResult.pronunciation_metrics),
     storagePath,
     persisted,
     sessionId,
