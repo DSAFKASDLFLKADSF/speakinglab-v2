@@ -45,8 +45,10 @@ def create_speech_evaluation_provider(settings: Any) -> SpeechEvaluationProvider
             voice_encode_type=settings.tencent_soe_voice_encode_type,
             eval_mode_free=settings.tencent_soe_eval_mode_free,
             eval_mode_reference=settings.tencent_soe_eval_mode_reference,
+            score_coeff=settings.tencent_soe_score_coeff,
         )
     raise SpeechEvaluationProviderError(
         "No speech evaluation provider is configured. Set "
         "SPEECH_EVAL_PROVIDER=mock for local development or configure Tencent SOE."
     )
+

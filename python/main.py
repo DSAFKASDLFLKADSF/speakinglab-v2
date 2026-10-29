@@ -111,10 +111,13 @@ class Settings(BaseSettings):
         default=1, alias="TENCENT_SOE_VOICE_ENCODE_TYPE"
     )
     tencent_soe_eval_mode_free: int = Field(
-        default=0, alias="TENCENT_SOE_EVAL_MODE_FREE"
+        default=3, alias="TENCENT_SOE_EVAL_MODE_FREE"
     )
     tencent_soe_eval_mode_reference: int = Field(
         default=1, alias="TENCENT_SOE_EVAL_MODE_REFERENCE"
+    )
+    tencent_soe_score_coeff: float = Field(
+        default=4.0, ge=1.0, le=4.0, alias="TENCENT_SOE_SCORE_COEFF"
     )
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: str = Field(
@@ -1614,3 +1617,4 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+

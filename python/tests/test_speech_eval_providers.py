@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import io
 import sys
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,7 +18,11 @@ from providers.speech_eval.factory import (
     resolve_speech_evaluation_provider_name,
 )
 from providers.speech_eval.mock_speech_eval import MockSpeechEvaluationProvider
-from providers.speech_eval.tencent_soe import TencentSOEProvider, _parse_result
+from audio_encoding import pcm_to_wav
+from providers.speech_eval.tencent_soe import TencentSOEProvider, TencentSOEError, _parse_result
+
+
+PCM_FIXTURE = b"\x00\x01" * 1600
 
 
 def _transcript() -> TranscriptResult:
@@ -57,8 +63,8 @@ class SpeechEvaluationContractTests(unittest.TestCase):
                 "Response": {
                     "Data": {
                         "PronAccuracy": 91.25,
-                        "PronFluency": 87,
-                        "PronCompletion": 80,
+                        "PronFluency": 0.87,
+                        "PronCompletion": 0.80,
                         "SentenceInfoSet": [
                             {
                                 "Words": [
@@ -72,6 +78,8 @@ class SpeechEvaluationContractTests(unittest.TestCase):
             }
         )
         self.assertEqual(result.pronunciation_accuracy, 91.2)
+        self.assertEqual(result.pronunciation_fluency, 87)
+        self.assertEqual(result.completeness, 80)
         self.assertEqual(result.words[1].start, 0.6)
         self.assertEqual(result.words[1].status, "ok")
 
@@ -80,10 +88,10 @@ class SpeechEvaluationContractTests(unittest.TestCase):
         with patch.object(
             provider,
             "_request",
-            return_value={"Response": {"PronAccuracy": 90, "PronFluency": 85}},
+            return_value={"Response": {"PronAccuracy": 90, "PronFluency": 0.85}},
         ) as request:
             result = provider.evaluate(
-                b"fixture",
+                pcm_to_wav(PCM_FIXTURE),
                 transcript=_transcript(),
                 mode="reference",
                 reference_text="Hello world",
@@ -91,8 +99,51 @@ class SpeechEvaluationContractTests(unittest.TestCase):
         body = request.call_args.args[0]
         self.assertEqual(body["RefText"], "Hello world")
         self.assertEqual(body["EvalMode"], 1)
-        self.assertEqual(base64.b64decode(body["VoiceData"]), b"fixture")
+        self.assertEqual(base64.b64decode(body["UserVoiceData"]), PCM_FIXTURE)
+        self.assertNotIn("VoiceData", body)
+        self.assertEqual(body["WorkMode"], 1)
+        self.assertEqual(body["ScoreCoeff"], 4)
         self.assertEqual(result.provider, "tencent")
+
+    def test_tencent_uses_initialized_api_and_free_speaking_mode(self):
+        provider = TencentSOEProvider(secret_id="id", secret_key="key")
+        with patch.object(provider.client, "request", return_value={"Response": {"PronAccuracy": 90}}) as request:
+            result = provider.evaluate(pcm_to_wav(PCM_FIXTURE), transcript=_transcript(), mode="free_speaking")
+        self.assertEqual(request.call_args.args[0], "TransmitOralProcessWithInit")
+        body = request.call_args.args[1]
+        self.assertEqual(body["EvalMode"], 3)
+        self.assertNotIn("RefText", body)
+        self.assertIsNone(result.pronunciation_fluency)
+
+    def test_unavailable_provider_ratios_are_not_fabricated_as_zero(self):
+        result = _parse_result({"Response": {"PronAccuracy": 90, "PronFluency": -1, "PronCompletion": -1}})
+        self.assertEqual(result.pronunciation_accuracy, 90)
+        self.assertIsNone(result.pronunciation_fluency)
+        self.assertIsNone(result.completeness)
+
+    def test_word_times_use_field_units_even_for_fractional_milliseconds(self):
+        result = _parse_result({"Response": {"Words": [
+            {"Word": "Hello", "MemBeginTime": 100.5, "MemEndTime": 900.5},
+            {"Word": "world", "start": 1, "end": 2},
+        ]}})
+        self.assertEqual(result.words[0].start, 0.1005)
+        self.assertEqual(result.words[1].start, 1)
+
+    def test_wav_configuration_sends_matching_container(self):
+        provider = TencentSOEProvider(secret_id="id", secret_key="key", voice_file_type=2)
+        with patch.object(provider, "_request", return_value={"Response": {"PronAccuracy": 90}}) as request:
+            provider.evaluate(pcm_to_wav(PCM_FIXTURE), transcript=_transcript(), mode="free_speaking")
+        body = request.call_args.args[0]
+        self.assertEqual(body["VoiceFileType"], 2)
+        with wave.open(io.BytesIO(base64.b64decode(body["UserVoiceData"])), "rb") as recording:
+            self.assertEqual(recording.getframerate(), 16000)
+            self.assertEqual(recording.readframes(1600), PCM_FIXTURE)
+
+    def test_invalid_audio_fails_before_cloud_request(self):
+        provider = TencentSOEProvider(secret_id="id", secret_key="key")
+        with patch.object(provider, "_request") as request, self.assertRaises(TencentSOEError):
+            provider.evaluate(b"not an audio container", transcript=_transcript(), mode="free_speaking")
+        request.assert_not_called()
 
     def test_factory_selects_mock(self):
         settings = MagicMock(speech_eval_provider="mock")
@@ -102,3 +153,4 @@ class SpeechEvaluationContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

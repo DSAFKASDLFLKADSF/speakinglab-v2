@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import math
 import json
+import io
 import sys
 import unittest
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +51,60 @@ def _voiced_with_pause() -> np.ndarray:
 
 
 class AcousticFeatureTests(unittest.TestCase):
+    def test_same_pause_is_consistent_across_microphone_sample_rates(self):
+        measured = []
+        for sr in (16_000, 44_100, 48_000):
+            t = np.arange(sr, dtype=np.float32) / sr
+            tone = (0.35 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
+            audio = np.concatenate([tone, np.zeros(round(0.32 * sr), np.float32), tone])
+            features = analyze_audio_features(audio, "hello world", sample_rate=sr)
+            self.assertEqual(features.analysis_source, "waveform")
+            self.assertEqual(features.pause_count, 1)
+            measured.append(features)
+        for features in measured[1:]:
+            self.assertAlmostEqual(features.longest_pause, measured[0].longest_pause, delta=0.005)
+            self.assertAlmostEqual(features.wpm, measured[0].wpm, delta=0.1)
+            self.assertAlmostEqual(features.pitch_median, 180, delta=3)
+
+    def test_48khz_wav_and_array_produce_the_same_metrics(self):
+        sr = 48_000
+        t = np.arange(sr, dtype=np.float32) / sr
+        tone = (0.35 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
+        audio = np.concatenate([tone, np.zeros(round(0.32 * sr), np.float32), tone])
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as recording:
+            recording.setnchannels(1)
+            recording.setsampwidth(2)
+            recording.setframerate(sr)
+            recording.writeframes((audio * 32767).astype("<i2").tobytes())
+        decoded = analyze_audio_features(buffer.getvalue(), "hello world", content_type="audio/wav")
+        direct = analyze_audio_features(audio, "hello world", sample_rate=sr)
+        self.assertEqual(decoded.analysis_source, "waveform")
+        self.assertEqual(decoded.pause_count, direct.pause_count)
+        self.assertAlmostEqual(decoded.longest_pause, direct.longest_pause, delta=0.005)
+        self.assertAlmostEqual(decoded.duration_seconds, direct.duration_seconds, delta=0.01)
+
+    def test_lexical_like_and_kind_of_are_not_counted_as_hesitation(self):
+        features = features_from_transcription(
+            "I like mathematics and this kind of problem. You know the answer.",
+            duration_seconds=5,
+        )
+        self.assertEqual(features.filler_count, 0)
+        fillers = features_from_transcription("Um, uh, erm, hmm, I agree.", duration_seconds=5)
+        self.assertEqual(fillers.filler_count, 4)
+
+    def test_silent_waveform_with_asr_text_has_no_articulation_rate(self):
+        features = analyze_audio_features(np.zeros(SAMPLE_RATE, np.float32), "hallucinated words")
+        self.assertEqual(features.articulation_rate, 0)
+        self.assertEqual(features.speech_duration_seconds, 0)
+        self.assertIsNone(features.pitch_median)
+
+    def test_invalid_waveform_falls_back_without_nan_metrics(self):
+        features = analyze_audio_features(np.array([0, np.nan, np.inf]), "hello", duration_hint=1)
+        self.assertEqual(features.analysis_source, "transcript")
+        self.assertTrue(math.isfinite(features.wpm))
+        self.assertIsNone(features.pitch_median)
+
     def test_waveform_silence_is_measured_without_word_gap(self):
         features = analyze_audio_features(
             _voiced_with_pause(),
@@ -188,3 +244,4 @@ class AcousticFeatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
