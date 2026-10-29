@@ -20,7 +20,9 @@ from providers.asr.base import TranscriptWord
 logger = logging.getLogger(__name__)
 
 FILLER_PATTERN = re.compile(
-    r"\b(um+|uh+|er+|ah+|em+|hmm+|like|you know|i mean|sort of|kind of)\b",
+    # Lexical uses of "like", "kind of", etc. cannot be classified as
+    # hesitation from text alone. Count only explicit vocalized fillers.
+    r"\b(um+|uh+|er+m*|ah+|em+|hmm+)\b",
     re.IGNORECASE,
 )
 
@@ -33,6 +35,7 @@ DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_FRAME_LENGTH = 320
 DEFAULT_HOP_LENGTH = 160
 DEFAULT_PITCH_FRAME_LENGTH = 2048
+DEFAULT_PITCH_HOP_LENGTH = 320  # 20 ms; pitch needs fewer frames than pauses.
 MIN_RMS = 1e-4
 
 
@@ -194,6 +197,9 @@ def _load_audio(
         sr = sample_rate or DEFAULT_SAMPLE_RATE
         return audio, sr, []
 
+    # Browser files are commonly 44.1/48 kHz. The analysis windows below are
+    # defined at 16 kHz; preserve duration while decoding at that rate.
+    sample_rate = sample_rate or DEFAULT_SAMPLE_RATE
     if isinstance(audio, bytes):
         return _load_audio_bytes(audio, suffix=suffix, sample_rate=sample_rate)
 
@@ -210,14 +216,16 @@ def _detect_pauses_from_audio(
     silence_threshold_db: float = DEFAULT_SILENCE_THRESHOLD_DB,
     frame_length: int = DEFAULT_FRAME_LENGTH,
     hop_length: int = DEFAULT_HOP_LENGTH,
+    rms: np.ndarray | None = None,
 ) -> list[float]:
     """Return pause durations (seconds) detected from low-energy regions."""
     if y.size == 0:
         return []
 
-    rms = librosa.feature.rms(
-        y=y, frame_length=frame_length, hop_length=hop_length
-    )[0]
+    if rms is None:
+        rms = librosa.feature.rms(
+            y=y, frame_length=frame_length, hop_length=hop_length
+        )[0]
     rms = np.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0)
     if rms.size == 0:
         return []
@@ -257,7 +265,7 @@ def _prosody_from_audio(
     sr: int,
     *,
     frame_length: int = DEFAULT_PITCH_FRAME_LENGTH,
-    hop_length: int = DEFAULT_HOP_LENGTH,
+    hop_length: int = DEFAULT_PITCH_HOP_LENGTH,
 ) -> tuple[float | None, float | None, float | None]:
     """Return pitch median, pitch spread, and relative RMS variation."""
     if y.size == 0 or not np.any(np.abs(y) > 0):
@@ -318,13 +326,15 @@ def _voiced_span_seconds(
     silence_threshold_db: float = DEFAULT_SILENCE_THRESHOLD_DB,
     frame_length: int = DEFAULT_FRAME_LENGTH,
     hop_length: int = DEFAULT_HOP_LENGTH,
+    rms: np.ndarray | None = None,
 ) -> float:
     """Return the voiced envelope span, excluding leading/trailing silence."""
     if y.size == 0:
         return 0.0
-    rms = librosa.feature.rms(
-        y=y, frame_length=frame_length, hop_length=hop_length
-    )[0]
+    if rms is None:
+        rms = librosa.feature.rms(
+            y=y, frame_length=frame_length, hop_length=hop_length
+        )[0]
     rms = np.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0)
     max_rms = float(np.max(rms)) if rms.size else 0.0
     if max_rms < MIN_RMS:
@@ -477,7 +487,14 @@ def analyze_audio_features(
             sample_rate=sample_rate,
             suffix=suffix,
         )
+        if not _positive_number(sr) or y.ndim != 1 or not np.all(np.isfinite(y)):
+            raise ValueError("Audio must be a finite mono waveform with a positive sample rate")
+        if sr != DEFAULT_SAMPLE_RATE:
+            y = librosa.resample(y, orig_sr=sr, target_sr=DEFAULT_SAMPLE_RATE)
+            sr = DEFAULT_SAMPLE_RATE
     except Exception as exc:
+        for path in temp_paths:
+            path.unlink(missing_ok=True)
         logger.warning("Audio decode failed (%s), using fallback metrics.", exc)
         return _fallback_features(
             transcript,
@@ -494,11 +511,15 @@ def analyze_audio_features(
         duration_seconds = float(librosa.get_duration(y=y, sr=sr))
         duration_seconds = max(duration_seconds, 0.1)
 
+        rms = librosa.feature.rms(
+            y=y, frame_length=DEFAULT_FRAME_LENGTH, hop_length=DEFAULT_HOP_LENGTH
+        )[0] if y.size else np.empty(0)
         audio_pauses = _detect_pauses_from_audio(
             y,
             sr,
             min_pause_duration=min_pause_duration,
             silence_threshold_db=silence_threshold_db,
+            rms=rms,
         )
         # A successfully decoded recording is authoritative, including when
         # it contains no detectable internal silence. Timestamp gaps are used
@@ -509,9 +530,14 @@ def analyze_audio_features(
         longest_pause = round(max(pauses), 2) if pauses else 0.0
         total_pause_time = round(sum(pauses), 2)
         pause_ratio = round(min(total_pause_time / duration_seconds, 1.0), 3)
-        voiced_span = _voiced_span_seconds(y, sr, silence_threshold_db=silence_threshold_db)
-        speech_duration = max(voiced_span - total_pause_time, 0.1)
-        articulation_rate = round(word_count / (speech_duration / 60.0), 1) if word_count else 0.0
+        voiced_span = _voiced_span_seconds(
+            y, sr, silence_threshold_db=silence_threshold_db, rms=rms
+        )
+        speech_duration = max(voiced_span - total_pause_time, 0.0)
+        articulation_rate = (
+            round(word_count * 60 / max(speech_duration, 0.1), 1)
+            if word_count and speech_duration > 0 else 0.0
+        )
         pitch_median, pitch_variation, energy_variation = _prosody_from_audio(y, sr)
 
         duration_min = duration_seconds / 60.0
@@ -563,3 +589,4 @@ def acoustic_metrics_to_dict(features: AudioFeatures) -> dict[str, object]:
         },
         "source": features.analysis_source,
     }
+

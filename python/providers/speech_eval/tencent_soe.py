@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from audio_encoding import AudioEncodingError, pcm_to_wav, to_pcm16
 from providers.asr.base import TranscriptResult
 from providers.tencent_cloud import TencentCloudClient, TencentCloudError
 
@@ -29,7 +30,7 @@ DEFAULT_REGION = "ap-guangzhou"
 DEFAULT_TIMEOUT = 120.0
 SERVICE = "soe"
 VERSION = "2018-07-24"
-ACTION = "TransmitOralProcess"
+ACTION = "TransmitOralProcessWithInit"
 
 
 class TencentSOEError(SpeechEvaluationProviderError):
@@ -53,6 +54,24 @@ def _score(value: Any) -> float | None:
     # Tencent returns 0-100 scores. Clamp malformed provider values before
     # exposing them to scoring or UI code.
     return round(max(0.0, min(100.0, number)), 1)
+
+
+def _ratio_score(value: Any) -> float | None:
+    """Tencent fluency/completion are fractions; -1 means unavailable."""
+    number = _number(value)
+    if number is None or not 0 <= number <= 1:
+        return None
+    return round(number * 100, 1)
+
+
+def _word_time(item: dict[str, Any], *, end: bool = False) -> float | None:
+    ms_names = ("EndMs", "end_ms", "EndTime", "MemEndTime") if end else ("StartMs", "start_ms", "StartTime", "MemBeginTime")
+    for name in ms_names:
+        if item.get(name) is not None:
+            value = _number(item[name])
+            return value / 1000 if value is not None and value >= 0 else None
+    value = _number(item.get("end" if end else "start"))
+    return value if value is not None and value >= 0 else None
 
 
 def _first(payload: dict[str, Any], *names: str) -> Any:
@@ -80,12 +99,8 @@ def _parse_word(item: dict[str, Any]) -> PronunciationWord | None:
     }.get(raw_status)
     if status is None:
         status = "ok" if score is None or score >= 80 else "needs_review"
-    start = _number(_first(item, "StartMs", "start_ms", "StartTime", "start"))
-    end = _number(_first(item, "EndMs", "end_ms", "EndTime", "end"))
-    if start is not None and (start > 100 or float(start).is_integer()):
-        start /= 1000
-    if end is not None and (end > 100 or float(end).is_integer()):
-        end /= 1000
+    start = _word_time(item)
+    end = _word_time(item, end=True)
     return PronunciationWord(word=word, score=score, status=status, start=start, end=end)
 
 
@@ -99,10 +114,10 @@ def _parse_result(
     accuracy = _score(
         _first(data, "PronAccuracy", "PronunciationAccuracy", "pronunciation_accuracy")
     )
-    fluency = _score(
+    fluency = _ratio_score(
         _first(data, "PronFluency", "PronunciationFluency", "pronunciation_fluency")
     )
-    completeness = _score(
+    completeness = _ratio_score(
         _first(data, "PronCompletion", "Completeness", "completeness")
     )
     raw_words: list[Any] = []
@@ -121,10 +136,9 @@ def _parse_result(
                 parsed = _parse_word(candidate)
                 if parsed:
                     words.append(parsed)
-    if accuracy is None and words:
-        accuracy = round(sum(word.score or 0 for word in words) / len(words), 1)
-    if fluency is None and accuracy is not None:
-        fluency = accuracy
+    word_scores = [word.score for word in words if word.score is not None]
+    if accuracy is None and word_scores:
+        accuracy = round(sum(word_scores) / len(word_scores), 1)
     return PronunciationMetrics(
         pronunciation_accuracy=accuracy,
         pronunciation_fluency=fluency,
@@ -148,8 +162,9 @@ class TencentSOEProvider(SpeechEvaluationProvider):
         timeout: float = DEFAULT_TIMEOUT,
         voice_file_type: int = 1,
         voice_encode_type: int = 1,
-        eval_mode_free: int = 0,
+        eval_mode_free: int = 3,
         eval_mode_reference: int = 1,
+        score_coeff: float = 4.0,
     ) -> None:
         self.secret_id = (secret_id or os.getenv("TENCENT_SECRET_ID") or "").strip()
         self.secret_key = (secret_key or os.getenv("TENCENT_SECRET_KEY") or "").strip()
@@ -160,6 +175,7 @@ class TencentSOEProvider(SpeechEvaluationProvider):
         self.voice_encode_type = voice_encode_type
         self.eval_mode_free = eval_mode_free
         self.eval_mode_reference = eval_mode_reference
+        self.score_coeff = score_coeff
         self.client = TencentCloudClient(
             secret_id=self.secret_id,
             secret_key=self.secret_key,
@@ -180,8 +196,9 @@ class TencentSOEProvider(SpeechEvaluationProvider):
             timeout=float(os.getenv("TENCENT_SOE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)),
             voice_file_type=int(os.getenv("TENCENT_SOE_VOICE_FILE_TYPE", "1")),
             voice_encode_type=int(os.getenv("TENCENT_SOE_VOICE_ENCODE_TYPE", "1")),
-            eval_mode_free=int(os.getenv("TENCENT_SOE_EVAL_MODE_FREE", "0")),
+            eval_mode_free=int(os.getenv("TENCENT_SOE_EVAL_MODE_FREE", "3")),
             eval_mode_reference=int(os.getenv("TENCENT_SOE_EVAL_MODE_REFERENCE", "1")),
+            score_coeff=float(os.getenv("TENCENT_SOE_SCORE_COEFF", "4.0")),
         )
 
     def _request(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -210,17 +227,28 @@ class TencentSOEProvider(SpeechEvaluationProvider):
             audio_bytes = audio.read()
         if not audio_bytes:
             raise TencentSOEError("Tencent SOE cannot evaluate empty audio.")
+        if mode == "reference" and not (reference_text or "").strip():
+            raise TencentSOEError("Reference text is required for reference evaluation.")
+        if self.voice_file_type not in (1, 2) or self.voice_encode_type != 1:
+            raise TencentSOEError("Tencent SOE conversion supports VoiceFileType 1/2 and PCM encoding 1.")
+        if not 1 <= self.score_coeff <= 4:
+            raise TencentSOEError("Tencent SOE ScoreCoeff must be between 1 and 4.")
+        try:
+            pcm = to_pcm16(audio_bytes)
+        except AudioEncodingError as exc:
+            raise TencentSOEError(str(exc)) from exc
+        audio_bytes = pcm_to_wav(pcm) if self.voice_file_type == 2 else pcm
 
         body: dict[str, Any] = {
             "VoiceFileType": self.voice_file_type,
             "VoiceEncodeType": self.voice_encode_type,
             "SeqId": 1,
             "IsEnd": 1,
-            "VoiceData": base64.b64encode(audio_bytes).decode("ascii"),
+            "UserVoiceData": base64.b64encode(audio_bytes).decode("ascii"),
             "SessionId": uuid.uuid4().hex,
-            "WorkMode": 0,
+            "WorkMode": 1,
             "EvalMode": self.eval_mode_reference if mode == "reference" else self.eval_mode_free,
-            "ScoreCoeff": 1.0,
+            "ScoreCoeff": self.score_coeff,
             "ServerType": 0,
             "TextMode": 0,
             "SentenceInfoEnabled": 1,
@@ -235,3 +263,4 @@ class TencentSOEProvider(SpeechEvaluationProvider):
             del transcript
         response = self._request(body)
         return _parse_result(response, model="tencent:soe")
+
